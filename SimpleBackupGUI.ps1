@@ -16,12 +16,18 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
+# Import modules for program files integration
+$modulesPath = Join-Path $PSScriptRoot "modules"
+. "$modulesPath\ConfigManager.ps1"
+. "$modulesPath\GoogleDriveAuthManager.ps1"
+
 # Variabel global
-$script:ConfigFile = "config\auto_backup_config.json"
-$script:TokenFile = "config\token.json"
-$script:LogFile = "logs\backup_$(Get-Date -Format 'yyyy-MM-dd').log"
+$scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Definition
+$script:ConfigManager = $null
+$script:AuthManager = $null
 $script:BackupItems = @()
 $script:SelectedItems = @()
+$script:DebugMode = $false
 
 # Fungsi untuk menulis log
 function Write-Log {
@@ -30,41 +36,66 @@ function Write-Log {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $logMessage = "[$timestamp] [$level] $message"
 
-    # Tulis ke file
-    $logMessage | Out-File -FilePath $script:LogFile -Append
-
     # Tulis ke console jika debug mode
     if ($script:DebugMode) {
-        Write-Host $logMessage
+        $color = switch($level) {
+            "ERROR" { "Red" }
+            "WARNING" { "Yellow" }
+            "INFO" { "Green" }
+            default { "White" }
+        }
+        Write-Host $logMessage -ForegroundColor $color
+    }
+
+    # Tulis ke file jika ConfigManager sudah diinisialisasi
+    if ($script:ConfigManager) {
+        try {
+            $logFile = $script:ConfigManager.GetLogFilePath("backup_gui")
+            $logMessage | Out-File -FilePath $logFile -Append -ErrorAction SilentlyContinue
+        }
+        catch {
+            # Fallback ke console jika file logging gagal
+            Write-Host "LOG ERROR: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host $logMessage -ForegroundColor White
+        }
+    }
+    else {
+        # Fallback ke console jika ConfigManager belum siap
+        $color = switch($level) {
+            "ERROR" { "Red" }
+            "WARNING" { "Yellow" }
+            "INFO" { "Green" }
+            default { "White" }
+        }
+        Write-Host $logMessage -ForegroundColor $color
     }
 }
 
 # Fungsi untuk membaca konfigurasi
 function Get-BackupConfig {
-    if (-not (Test-Path $script:ConfigFile)) {
-        Write-Log "File config tidak ditemukan, membuat default..."
-        $defaultConfig = @{
-            google_drive = @{
-                token_file = "token.json"
-                scopes = @("https://www.googleapis.com/auth/drive.file")
-                client_id = ""
-                client_secret = ""
-            }
-            backup_items = @()
-            scheduled_tasks = @()
-            settings = @{
-                auto_scan_enabled = $true
-                scan_interval_minutes = 30
-                max_backup_history = 100
-                compression_level = 6
-            }
-        }
-        $defaultConfig | ConvertTo-Json -Depth 10 | Out-File -FilePath $script:ConfigFile -Encoding UTF8
+    if (-not $script:ConfigManager) {
+        Write-Log "ConfigManager tidak diinisialisasi" "ERROR"
+        return $null
     }
 
     try {
-        $config = Get-Content $script:ConfigFile -Raw | ConvertFrom-Json
-        
+        $googleDriveConfig = $script:ConfigManager.GetGoogleDriveConfig()
+        $backupItems = $script:ConfigManager.GetBackupItems()
+        $scheduledTasks = $script:ConfigManager.GetScheduledTasks()
+        $settings = $script:ConfigManager.GetSettings()
+
+        Write-Host "DEBUG: Get-BackupConfig - backupItems from ConfigManager:" -ForegroundColor Magenta
+        foreach ($item in $backupItems) {
+            Write-Host "  Name: $($item.Name), SourcePath: '$($item.SourcePath)'" -ForegroundColor Magenta
+        }
+
+        $config = @{
+            google_drive = $googleDriveConfig
+            backup_items = $backupItems
+            scheduled_tasks = $scheduledTasks
+            settings = $settings
+        }
+
         # Ensure all backup items have DestinationType property (migrate existing items)
         if ($config.backup_items) {
             foreach ($item in $config.backup_items) {
@@ -73,13 +104,19 @@ function Get-BackupConfig {
                 }
             }
         }
-        
+
+        Write-Host "DEBUG: Get-BackupConfig - config.backup_items after processing:" -ForegroundColor Magenta
+        foreach ($item in $config.backup_items) {
+            Write-Host "  Name: $($item.Name), SourcePath: '$($item.SourcePath)'" -ForegroundColor Magenta
+        }
+
         $script:BackupItems = $config.backup_items
-        Write-Log "Config berhasil dimuat"
+        Write-Log "Config berhasil dimuat dari ConfigManager"
         return $config
     }
     catch {
-        Write-Log "Gagal membaca config: $($_.Exception.Message)" "ERROR"
+        $errorMsg = "Gagal membaca config: " + $_.Exception.Message
+        Write-Log $errorMsg "ERROR"
         return $null
     }
 }
@@ -88,13 +125,38 @@ function Get-BackupConfig {
 function Save-BackupConfig {
     param([object]$config)
 
+    if (-not $script:ConfigManager) {
+        Write-Log "ConfigManager tidak diinisialisasi" "ERROR"
+        return $false
+    }
+
     try {
-        $config | ConvertTo-Json -Depth 10 | Out-File -FilePath $script:ConfigFile -Encoding UTF8
-        Write-Log "Config berhasil disimpan"
+        # Update Google Drive configuration
+        if ($config.google_drive) {
+            $script:ConfigManager.UpdateGoogleDriveConfig($config.google_drive)
+        }
+
+        # Update settings
+        if ($config.settings) {
+            $script:ConfigManager.UpdateSettings($config.settings)
+        }
+
+        # Update backup items
+        if ($config.backup_items) {
+            $script:ConfigManager.UpdateBackupItems($config.backup_items)
+        }
+
+        # Update scheduled tasks
+        if ($config.scheduled_tasks) {
+            $script:ConfigManager.UpdateScheduledTasks($config.scheduled_tasks)
+        }
+
+        Write-Log "Config berhasil disimpan melalui ConfigManager"
         return $true
     }
     catch {
-        Write-Log "Gagal menyimpan config: $($_.Exception.Message)" "ERROR"
+        $errorMsg = "Gagal menyimpan config: " + $_.Exception.Message
+        Write-Log $errorMsg "ERROR"
         return $false
     }
 }
@@ -103,72 +165,72 @@ function Save-BackupConfig {
 function Connect-GoogleDrive {
     param([string]$clientId, [string]$clientSecret)
 
-    # Simpan client credentials ke config
-    $config = Get-BackupConfig
-    $config.google_drive.client_id = $clientId
-    $config.google_drive.client_secret = $clientSecret
-    Save-BackupConfig $config
-
-    # Cek token yang sudah ada
-    if (Test-Path $script:TokenFile) {
-        try {
-            $tokenData = Get-Content $script:TokenFile -Raw | ConvertFrom-Json
-
-            # Cek apakah token masih valid
-            if ($tokenData.access_token -and $tokenData.expiry) {
-                $expiryTime = [datetime]$tokenData.expiry
-                if ($expiryTime -gt (Get-Date).AddMinutes(5)) {
-                    Write-Log "Token masih valid, menggunakan token yang ada"
-                    return $true
-                }
-            }
-
-            # Coba refresh token jika ada refresh_token
-            if ($tokenData.refresh_token) {
-                Write-Log "Token expired, mencoba refresh token..."
-                $refreshResult = Refresh-GoogleDriveToken -refreshToken $tokenData.refresh_token -clientId $clientId -clientSecret $clientSecret
-                if ($refreshResult.Success) {
-                    return $true
-                }
-            }
-        }
-        catch {
-            Write-Log "Token tidak valid: $($_.Exception.Message)" "WARN"
-        }
+    if (-not $script:ConfigManager -or -not $script:AuthManager) {
+        Write-Log "ConfigManager atau AuthManager tidak diinisialisasi" "ERROR"
+        return $false
     }
 
-    Write-Log "Token tidak ditemukan atau tidak valid. Silakan setup token terlebih dahulu." "ERROR"
-    return $false
+    try {
+        # Simpan client credentials ke config
+        $config = Get-BackupConfig
+        if ($config -and $config.google_drive) {
+            $config.google_drive.client_id = $clientId
+            $config.google_drive.client_secret = $clientSecret
+            Save-BackupConfig $config
+        }
+
+        # Coba autentikasi menggunakan AuthManager
+        $authResult = $script:AuthManager.Authenticate()
+
+        if ($authResult.Success) {
+            Write-Log "Berhasil terhubung ke Google Drive"
+            return $true
+        } else {
+            $errorMsg = "Gagal terhubung ke Google Drive: " + $authResult.Message
+            Write-Log $errorMsg "ERROR"
+
+            # Jika manual authentication diperlukan, tampilkan URL
+            if ($authResult.AuthUrl) {
+                Write-Log "Manual authentication diperlukan. Buka URL berikut:" "INFO"
+                Write-Log $authResult.AuthUrl "INFO"
+                return $false
+            }
+
+            return $false
+        }
+    }
+    catch {
+        $errorMsg = "Error dalam Connect-GoogleDrive: " + $_.Exception.Message
+        Write-Log $errorMsg "ERROR"
+        return $false
+    }
 }
 
 # Fungsi untuk refresh token
 function Refresh-GoogleDriveToken {
     param([string]$refreshToken, [string]$clientId, [string]$clientSecret)
 
+    if (-not $script:AuthManager) {
+        Write-Log "AuthManager tidak diinisialisasi" "ERROR"
+        return @{ Success = $false; ErrorMessage = "AuthManager tidak diinisialisasi" }
+    }
+
     try {
-        $tokenEndpoint = "https://oauth2.googleapis.com/token"
-        $body = @{
-            client_id = $clientId
-            client_secret = $clientSecret
-            refresh_token = $refreshToken
-            grant_type = "refresh_token"
+        # Gunakan AuthManager untuk refresh token
+        $refreshResult = $script:AuthManager.RefreshToken()
+
+        if ($refreshResult.Success) {
+            Write-Log "Token berhasil di-refresh"
+            return @{ Success = $true }
+        } else {
+            $errorMsg = "Gagal refresh token: " + $refreshResult.Message
+            Write-Log $errorMsg "ERROR"
+            return @{ Success = $false; ErrorMessage = $refreshResult.Message }
         }
-
-        $response = Invoke-RestMethod -Uri $tokenEndpoint -Method Post -Body $body -ContentType "application/x-www-form-urlencoded"
-
-        # Update token file dengan token baru
-        $currentToken = Get-Content $script:TokenFile -Raw | ConvertFrom-Json
-        $currentToken.access_token = $response.access_token
-        $currentToken.expires_in = $response.expires_in
-        $currentToken.expiry = (Get-Date).AddSeconds($response.expires_in).ToString("o")
-
-        $currentToken | ConvertTo-Json -Depth 10 | Out-File -FilePath $script:TokenFile -Encoding UTF8
-
-        Write-Log "Token berhasil di-refresh"
-        return @{ Success = $true }
     }
     catch {
-        Write-Log "Gagal refresh token: $($_.Exception.Message)" "ERROR"
+        $errorMsg = "Error dalam Refresh-GoogleDriveToken: " + $_.Exception.Message
+        Write-Log $errorMsg "ERROR"
         return @{ Success = $false; ErrorMessage = $_.Exception.Message }
     }
 }
@@ -180,29 +242,29 @@ function Upload-ToGoogleDrive {
     Write-Log "Upload $fileName ke Google Drive..." "INFO"
 
     try {
-        # Baca token yang ada
-        if (-not (Test-Path $script:TokenFile)) {
-            Write-Log "Token file tidak ditemukan" "ERROR"
+        # Cek token menggunakan AuthManager
+        if (-not $script:AuthManager -or -not $script:AuthManager.IsAuthenticated()) {
+            Write-Log "Token tidak valid atau tidak ditemukan" "ERROR"
             return @{ Success = $false; ErrorMessage = "Token tidak ditemukan" }
         }
 
-        $tokenData = Get-Content $script:TokenFile -Raw | ConvertFrom-Json
+        # Coba refresh token jika expired
+        if ($script:AuthManager.IsTokenValid()) {
+            Write-Log "Token masih valid" "INFO"
+        } else {
+            Write-Log "Token expired, mencoba refresh..." "WARN"
+            $refreshResult = $script:AuthManager.RefreshToken()
 
-        # Cek token expiry
-        if ($tokenData.expiry) {
-            $expiryTime = [datetime]$tokenData.expiry
-            if ($expiryTime -le (Get-Date).AddMinutes(5)) {
-                Write-Log "Token expired, mencoba refresh..." "WARN"
-                $config = Get-BackupConfig
-                $refreshResult = Refresh-GoogleDriveToken -refreshToken $tokenData.refresh_token -clientId $config.google_drive.client_id -clientSecret $config.google_drive.client_secret
-
-                if (-not $refreshResult.Success) {
-                    return @{ Success = $false; ErrorMessage = "Gagal refresh token" }
-                }
-
-                # Baca token yang sudah di-refresh
-                $tokenData = Get-Content $script:TokenFile -Raw | ConvertFrom-Json
+            if (-not $refreshResult.Success) {
+                return @{ Success = $false; ErrorMessage = "Gagal refresh token" }
             }
+        }
+
+        # Get access token from AuthManager
+        $accessToken = $script:AuthManager.GetAccessToken()
+        if ([string]::IsNullOrEmpty($accessToken)) {
+            Write-Log "Access token tidak tersedia" "ERROR"
+            return @{ Success = $false; ErrorMessage = "Access token tidak tersedia" }
         }
 
         # Read file content dengan error handling yang lebih baik
@@ -322,7 +384,7 @@ function Upload-ToGoogleDrive {
         Write-Log "Content type: $contentType" "INFO"
 
         $headers = @{
-            "Authorization" = "Bearer $($tokenData.access_token)"
+            "Authorization" = "Bearer $accessToken"
             "Content-Type" = $contentType
             "Content-Length" = $finalBody.Length
         }
@@ -383,6 +445,15 @@ function Backup-Item {
     Write-Log "Memulai backup $($backupItem.Name)" "INFO"
 
     try {
+        # Validasi SourcePath tidak null atau kosong
+        if ([string]::IsNullOrEmpty($backupItem.SourcePath)) {
+            Write-Log "SourcePath tidak valid atau kosong untuk item: $($backupItem.Name)" "ERROR"
+            return @{
+                Success = $false
+                ErrorMessage = "SourcePath tidak valid atau kosong"
+            }
+        }
+
         # Cek apakah path ada (for Google Drive backup)
         if ($backupItem.DestinationType -ne "Git" -and -not (Test-Path $backupItem.SourcePath)) {
             Write-Log "Path tidak ditemukan: $($backupItem.SourcePath)" "ERROR"
@@ -541,7 +612,8 @@ function Backup-Item {
                 }
             }
             catch {
-                Write-Log "Git backup $($backupItem.Name) gagal: $($_.Exception.Message)" "ERROR"
+                $errorMsg = "Git backup $($backupItem.Name) gagal: " + $_.Exception.Message
+                Write-Log $errorMsg "ERROR"
                 return @{
                     Success = $false
                     ErrorMessage = $_.Exception.Message
@@ -579,10 +651,11 @@ function Backup-Item {
                 }
             }
             catch {
-                Write-Log "Gagal memproses backup: $($_.Exception.Message)" "ERROR"
+                $errorMsg = "Gagal memproses backup: " + $_.Exception.Message
+                Write-Log $errorMsg "ERROR"
                 return @{
                     Success = $false
-                    ErrorMessage = "Gagal memproses backup: $($_.Exception.Message)"
+                    ErrorMessage = $errorMsg
                 }
             }
 
@@ -604,7 +677,8 @@ function Backup-Item {
         }
     }
     catch {
-        Write-Log "Backup $($backupItem.Name) gagal: $($_.Exception.Message)" "ERROR"
+        $errorMsg = "Backup $($backupItem.Name) gagal: " + $_.Exception.Message
+        Write-Log $errorMsg "ERROR"
         return @{
             Success = $false
             ErrorMessage = $_.Exception.Message
@@ -629,26 +703,37 @@ function Add-BackupItem {
         CreatedDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     }
 
-    $config = Get-BackupConfig
-    $config.backup_items += $newItem
-    Save-BackupConfig $config
+    if (-not $script:ConfigManager) {
+        Write-Log "ConfigManager tidak diinisialisasi" "ERROR"
+        return $false
+    }
+
+    # Get current backup items and add new item
+    $currentItems = $script:ConfigManager.GetBackupItems()
+    $newItems = @()
+    $newItems += $currentItems
+    $newItems += $newItem
+
+    # Save using ConfigManager
+    $script:ConfigManager.Config.backup_items = $newItems
+    $script:ConfigManager.SaveConfiguration()
 
     Write-Log "Item backup '$name' berhasil ditambahkan" "INFO"
-    return $newItem
+    return $true
 }
 
 # Fungsi untuk task scheduling
 function New-ScheduledTask {
     param(
         [string]$name,
-        [string]$backupItemName,
+        [string[]]$backupItemNames,  # Array of backup item names
         [string]$scheduleType,  # "Daily", "Weekly", "Monthly"
         [hashtable]$scheduleSettings
     )
 
     $newTask = @{
         Name = $name
-        BackupItemName = $backupItemName
+        BackupItemNames = $backupItemNames  # Changed to array
         ScheduleType = $scheduleType
         Enabled = $true
         CreatedDate = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
@@ -965,6 +1050,7 @@ function Show-ErrorDialog {
 
 # Membuat form utama
 function Show-MainForm {
+    Write-Host "DEBUG: Show-MainForm function called" -ForegroundColor Cyan
     # Buat form utama
     $mainForm = New-Object System.Windows.Forms.Form
     $mainForm.Text = "Simple Backup GUI - Google Drive"
@@ -975,11 +1061,28 @@ function Show-MainForm {
 
     # Load config awal
     $config = Get-BackupConfig
+    if (-not $config) {
+        [System.Windows.Forms.MessageBox]::Show("Failed to load configuration", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        return
+    }
 
     # Tab Control
     $tabControl = New-Object System.Windows.Forms.TabControl
     $tabControl.Size = New-Object System.Drawing.Size(780, 520)
     $tabControl.Location = New-Object System.Drawing.Point(10, 10)
+
+    # Status Label (dideklarasikan di awal)
+    $statusLabel = New-Object System.Windows.Forms.Label
+    $statusLabel.Location = New-Object System.Drawing.Point(10, 540)
+    $statusLabel.Size = New-Object System.Drawing.Size(760, 20)
+    $statusLabel.Text = "Ready"
+    $statusLabel.ForeColor = [System.Drawing.Color]::Green
+
+    # Progress Bar (dideklarasikan di awal)
+    $progressBar = New-Object System.Windows.Forms.ProgressBar
+    $progressBar.Location = New-Object System.Drawing.Point(10, 565)
+    $progressBar.Size = New-Object System.Drawing.Size(760, 20)
+    $progressBar.Visible = $false
 
     # Tab Backup Items
     $backupTab = New-Object System.Windows.Forms.TabPage
@@ -1003,96 +1106,93 @@ function Show-MainForm {
     $listView.Columns.Add("Status", 100) | Out-Null
     $listView.Columns.Add("Terakhir Backup", 120) | Out-Null
 
-    # Refresh list view
-    function Refresh-ListView {
-        $listView.Items.Clear()
-        foreach ($item in $script:BackupItems) {
-            $listItem = New-Object System.Windows.Forms.ListViewItem
-            $listItem.Text = $item.Name
-            $listItem.SubItems.Add($item.SourcePath) | Out-Null
-            $listItem.SubItems.Add($(if ($item.DestinationType) { $item.DestinationType } else { "GoogleDrive" })) | Out-Null  # Show destination type
-            $listItem.SubItems.Add($(if ($item.IsFolder) { "Folder" } else { "File" })) | Out-Null
-            $listItem.SubItems.Add($(if ($item.Enabled) { "Aktif" } else { "Non-aktif" })) | Out-Null
-            $listItem.SubItems.Add($item.LastBackup) | Out-Null
-            $listItem.Tag = $item
-            $listView.Items.Add($listItem) | Out-Null
-        }
-    }
-
-    # Tombol-tombol
+    # Buttons untuk backup tab
     $btnAdd = New-Object System.Windows.Forms.Button
-    $btnAdd.Text = "Tambah Item"
-    $btnAdd.Size = New-Object System.Drawing.Size(100, 30)
+    $btnAdd.Text = "Add Item"
+    $btnAdd.Size = New-Object System.Drawing.Size(80, 30)
     $btnAdd.Location = New-Object System.Drawing.Point(10, 370)
 
+    $btnEdit = New-Object System.Windows.Forms.Button
+    $btnEdit.Text = "Edit"
+    $btnEdit.Size = New-Object System.Drawing.Size(80, 30)
+    $btnEdit.Location = New-Object System.Drawing.Point(100, 370)
+
     $btnRemove = New-Object System.Windows.Forms.Button
-    $btnRemove.Text = "Hapus Item"
-    $btnRemove.Size = New-Object System.Drawing.Size(100, 30)
-    $btnRemove.Location = New-Object System.Drawing.Point(120, 370)
+    $btnRemove.Text = "Remove"
+    $btnRemove.Size = New-Object System.Drawing.Size(80, 30)
+    $btnRemove.Location = New-Object System.Drawing.Point(190, 370)
 
     $btnBackup = New-Object System.Windows.Forms.Button
     $btnBackup.Text = "Backup Selected"
     $btnBackup.Size = New-Object System.Drawing.Size(120, 30)
-    $btnBackup.Location = New-Object System.Drawing.Point(230, 370)
+    $btnBackup.Location = New-Object System.Drawing.Point(280, 370)
     $btnBackup.BackColor = [System.Drawing.Color]::LightGreen
 
     $btnRefresh = New-Object System.Windows.Forms.Button
     $btnRefresh.Text = "Refresh"
     $btnRefresh.Size = New-Object System.Drawing.Size(100, 30)
-    $btnRefresh.Location = New-Object System.Drawing.Point(360, 370)
+    $btnRefresh.Location = New-Object System.Drawing.Point(410, 370)
 
-    # Status label
-    $statusLabel = New-Object System.Windows.Forms.Label
-    $statusLabel.Text = "Ready"
-    $statusLabel.Size = New-Object System.Drawing.Size(750, 20)
-    $statusLabel.Location = New-Object System.Drawing.Point(10, 420)
-    $statusLabel.ForeColor = [System.Drawing.Color]::Green
+    # Event handlers for backup buttons
+    $btnBackup.Add_Click({
+        $selectedItems = $listView.CheckedItems
+        if ($selectedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Pilih minimal satu item untuk backup!", "Warning", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
 
-    # Progress bar
-    $progressBar = New-Object System.Windows.Forms.ProgressBar
-    $progressBar.Size = New-Object System.Drawing.Size(750, 20)
-    $progressBar.Location = New-Object System.Drawing.Point(10, 450)
-    $progressBar.Visible = $false
+        $btnBackup.Enabled = $false
+        $progressBar.Visible = $true
+        $progressBar.Value = 0
+        $progressBar.Maximum = $selectedItems.Count
 
-    # Tab Settings
-    $settingsTab = New-Object System.Windows.Forms.TabPage
-    $settingsTab.Text = "Settings"
-    $settingsTab.BackColor = [System.Drawing.Color]::White
+        foreach ($listItem in $selectedItems) {
+            $backupItem = $listItem.Tag
+            Write-Host "DEBUG: Backup button clicked - Item: $($backupItem.Name)" -ForegroundColor Yellow
+            Write-Host "DEBUG: Backup button clicked - SourcePath: '$($backupItem.SourcePath)'" -ForegroundColor Cyan
+            Write-Host "DEBUG: Backup button clicked - SourcePath is null: $($backupItem.SourcePath -eq $null)" -ForegroundColor Cyan
+            Write-Host "DEBUG: Backup button clicked - SourcePath is empty: $([string]::IsNullOrEmpty($backupItem.SourcePath))" -ForegroundColor Cyan
 
-    # Google Drive settings
-    $lblClientId = New-Object System.Windows.Forms.Label
-    $lblClientId.Text = "Client ID:"
-    $lblClientId.Location = New-Object System.Drawing.Point(20, 20)
-    $lblClientId.Size = New-Object System.Drawing.Size(100, 20)
+            $statusLabel.Text = "Membackup $($backupItem.Name)..."
 
-    $txtClientId = New-Object System.Windows.Forms.TextBox
-    $txtClientId.Size = New-Object System.Drawing.Size(500, 20)
-    $txtClientId.Location = New-Object System.Drawing.Point(120, 20)
-    $txtClientId.Text = $config.google_drive.client_id
+            $result = Backup-Item -backupItem $backupItem
 
-    $lblClientSecret = New-Object System.Windows.Forms.Label
-    $lblClientSecret.Text = "Client Secret:"
-    $lblClientSecret.Location = New-Object System.Drawing.Point(20, 50)
-    $lblClientSecret.Size = New-Object System.Drawing.Size(100, 20)
+            if ($result.Success) {
+                # Update last backup time
+                $config = Get-BackupConfig
+                $itemInConfig = $config.backup_items | Where-Object { $_.Name -eq $backupItem.Name }
+                if ($itemInConfig) {
+                    $itemInConfig.LastBackup = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    Save-BackupConfig $config
+                }
 
-    $txtClientSecret = New-Object System.Windows.Forms.TextBox
-    $txtClientSecret.Size = New-Object System.Drawing.Size(500, 20)
-    $txtClientSecret.Location = New-Object System.Drawing.Point(120, 50)
-    $txtClientSecret.Text = $config.google_drive.client_secret
-    $txtClientSecret.PasswordChar = "*"
+                $statusLabel.Text = "Backup $($backupItem.Name) berhasil"
+                $statusLabel.ForeColor = [System.Drawing.Color]::Green
+            }
+            else {
+                $statusLabel.Text = "Backup $($backupItem.Name) gagal: $($result.ErrorMessage)"
+                $statusLabel.ForeColor = [System.Drawing.Color]::Red
 
-    $btnConnect = New-Object System.Windows.Forms.Button
-    $btnConnect.Text = "Connect to Google Drive"
-    $btnConnect.Size = New-Object System.Drawing.Size(150, 30)
-    $btnConnect.Location = New-Object System.Drawing.Point(120, 80)
-    $btnConnect.BackColor = [System.Drawing.Color]::LightBlue
+                # Tampilkan error dialog dengan ukuran lebih besar
+                Show-ErrorDialog -title "Backup Gagal" -message "Backup $($backupItem.Name) gagal" -details $result.ErrorMessage
+            }
 
-    $btnSaveSettings = New-Object System.Windows.Forms.Button
-    $btnSaveSettings.Text = "Save Settings"
-    $btnSaveSettings.Size = New-Object System.Drawing.Size(100, 30)
-    $btnSaveSettings.Location = New-Object System.Drawing.Point(280, 80)
+            $progressBar.Value++
+            Start-Sleep -Milliseconds 500
+        }
 
-    # Event handlers
+        $progressBar.Visible = $false
+        $btnBackup.Enabled = $true
+        Refresh-ListView
+
+        [System.Windows.Forms.MessageBox]::Show("Backup selesai!", "Selesai", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+    })
+
+    $btnRefresh.Add_Click({
+        Refresh-ListView
+        $statusLabel.Text = "Daftar backup telah diperbarui"
+    })
+
     $btnAdd.Add_Click({
         # Form untuk menambah item baru
         $addForm = New-Object System.Windows.Forms.Form
@@ -1177,82 +1277,271 @@ function Show-MainForm {
         }
     })
 
-    $btnRemove.Add_Click({
+    $btnEdit.Add_Click({
         if ($listView.SelectedItems.Count -gt 0) {
             $selectedItem = $listView.SelectedItems[0]
-            $itemToRemove = $selectedItem.Tag
+            $itemToEdit = $selectedItem.Tag
 
-            $result = [System.Windows.Forms.MessageBox]::Show(
-                "Hapus item '$($itemToRemove.Name)'?",
-                "Konfirmasi",
-                [System.Windows.Forms.MessageBoxButtons]::YesNo,
-                [System.Windows.Forms.MessageBoxIcon]::Question
-            )
+            # Form untuk mengedit item
+            $editForm = New-Object System.Windows.Forms.Form
+            $editForm.Text = "Edit Backup Item"
+            $editForm.Size = New-Object System.Drawing.Size(400, 350)
+            $editForm.StartPosition = "CenterScreen"
 
-            if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
-                $config = Get-BackupConfig
-                $config.backup_items = $config.backup_items | Where-Object { $_.Name -ne $itemToRemove.Name }
-                Save-BackupConfig $config
-                Refresh-ListView
-                $statusLabel.Text = "Item '$($itemToRemove.Name)' berhasil dihapus"
+            $lblName = New-Object System.Windows.Forms.Label
+            $lblName.Text = "Nama:"
+            $lblName.Location = New-Object System.Drawing.Point(20, 20)
+            $lblName.Size = New-Object System.Drawing.Size(100, 20)
+
+            $txtName = New-Object System.Windows.Forms.TextBox
+            $txtName.Size = New-Object System.Drawing.Size(250, 20)
+            $txtName.Location = New-Object System.Drawing.Point(120, 20)
+            $txtName.Text = $itemToEdit.Name
+
+            $lblPath = New-Object System.Windows.Forms.Label
+            $lblPath.Text = "Path:"
+            $lblPath.Location = New-Object System.Drawing.Point(20, 50)
+            $lblPath.Size = New-Object System.Drawing.Size(100, 20)
+
+            $txtPath = New-Object System.Windows.Forms.TextBox
+            $txtPath.Size = New-Object System.Drawing.Size(250, 20)
+            $txtPath.Location = New-Object System.Drawing.Point(120, 50)
+            $txtPath.Text = $itemToEdit.SourcePath
+
+            $btnBrowse = New-Object System.Windows.Forms.Button
+            $btnBrowse.Text = "Browse..."
+            $btnBrowse.Size = New-Object System.Drawing.Size(75, 20)
+            $btnBrowse.Location = New-Object System.Drawing.Point(370, 50)
+
+            $lblDesc = New-Object System.Windows.Forms.Label
+            $lblDesc.Text = "Deskripsi:"
+            $lblDesc.Location = New-Object System.Drawing.Point(20, 80)
+            $lblDesc.Size = New-Object System.Drawing.Size(100, 20)
+
+            $txtDesc = New-Object System.Windows.Forms.TextBox
+            $txtDesc.Size = New-Object System.Drawing.Size(250, 60)
+            $txtDesc.Location = New-Object System.Drawing.Point(120, 80)
+            $txtDesc.Multiline = $true
+            $txtDesc.Text = $itemToEdit.Description
+
+            # Destination Type selection
+            $lblDestType = New-Object System.Windows.Forms.Label
+            $lblDestType.Text = "Tujuan:"
+            $lblDestType.Location = New-Object System.Drawing.Point(20, 150)
+            $lblDestType.Size = New-Object System.Drawing.Size(100, 20)
+
+            $cboDestType = New-Object System.Windows.Forms.ComboBox
+            $cboDestType.Size = New-Object System.Drawing.Size(250, 20)
+            $cboDestType.Location = New-Object System.Drawing.Point(120, 150)
+            $cboDestType.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+            $cboDestType.Items.AddRange(@("GoogleDrive", "Git")) | Out-Null
+            $cboDestType.SelectedItem = $itemToEdit.DestinationType
+
+            # Enabled checkbox
+            $chkEnabled = New-Object System.Windows.Forms.CheckBox
+            $chkEnabled.Text = "Aktif"
+            $chkEnabled.Location = New-Object System.Drawing.Point(120, 180)
+            $chkEnabled.Size = New-Object System.Drawing.Size(100, 20)
+            $chkEnabled.Checked = $itemToEdit.Enabled
+
+            $btnOK = New-Object System.Windows.Forms.Button
+            $btnOK.Text = "OK"
+            $btnOK.Size = New-Object System.Drawing.Size(75, 30)
+            $btnOK.Location = New-Object System.Drawing.Point(220, 240)
+            $btnOK.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+            $btnCancel = New-Object System.Windows.Forms.Button
+            $btnCancel.Text = "Cancel"
+            $btnCancel.Size = New-Object System.Drawing.Size(75, 30)
+            $btnCancel.Location = New-Object System.Drawing.Point(305, 240)
+            $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+            $editForm.Controls.AddRange(@($lblName, $txtName, $lblPath, $txtPath, $btnBrowse, $lblDesc, $txtDesc, $lblDestType, $cboDestType, $chkEnabled, $btnOK, $btnCancel))
+
+            $btnBrowse.Add_Click({
+                $folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
+                if ($folderBrowser.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                    $txtPath.Text = $folderBrowser.SelectedPath
+                }
+            })
+
+            if ($editForm.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+                if ($txtName.Text -and $txtPath.Text) {
+                    if (-not $script:ConfigManager) {
+                        [System.Windows.Forms.MessageBox]::Show("ConfigManager tidak diinisialisasi.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                        return
+                    }
+
+                    # Get current backup items and find the item to edit
+                    $currentItems = $script:ConfigManager.GetBackupItems()
+                    $itemIndex = -1
+                    for ($i = 0; $i -lt $currentItems.Count; $i++) {
+                        if ($currentItems[$i].Name -eq $itemToEdit.Name) {
+                            $itemIndex = $i
+                            break
+                        }
+                    }
+
+                    if ($itemIndex -ge 0) {
+                        # Update the item
+                        $currentItems[$itemIndex].Name = $txtName.Text
+                        $currentItems[$itemIndex].SourcePath = $txtPath.Text
+                        $currentItems[$itemIndex].Description = $txtDesc.Text
+                        $currentItems[$itemIndex].DestinationType = $cboDestType.SelectedItem
+                        $currentItems[$itemIndex].Enabled = $chkEnabled.Checked
+
+                        # Save using ConfigManager
+                        $script:ConfigManager.Config.backup_items = $currentItems
+                        $script:ConfigManager.SaveConfiguration()
+
+                        Refresh-ListView
+                        $statusLabel.Text = "Item '$($txtName.Text)' berhasil diperbarui"
+                    }
+                }
             }
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Pilih item yang akan diedit terlebih dahulu.", "Peringatan", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
         }
     })
 
-    $btnBackup.Add_Click({
-        $selectedItems = $listView.CheckedItems
-        if ($selectedItems.Count -eq 0) {
-            [System.Windows.Forms.MessageBox]::Show("Pilih minimal satu item untuk backup!", "Warning", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
-            return
-        }
-
-        $btnBackup.Enabled = $false
-        $progressBar.Visible = $true
-        $progressBar.Value = 0
-        $progressBar.Maximum = $selectedItems.Count
-
-        foreach ($listItem in $selectedItems) {
-            $backupItem = $listItem.Tag
-            $statusLabel.Text = "Membackup $($backupItem.Name)..."
-
-            $result = Backup-Item -backupItem $backupItem
-
-            if ($result.Success) {
-                # Update last backup time
-                $config = Get-BackupConfig
-                $itemInConfig = $config.backup_items | Where-Object { $_.Name -eq $backupItem.Name }
-                if ($itemInConfig) {
-                    $itemInConfig.LastBackup = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                    Save-BackupConfig $config
+    $btnRemove.Add_Click({
+        if ($listView.SelectedItems.Count -gt 0) {
+            $selectedItems = @($listView.SelectedItems)
+            $itemNames = $selectedItems | ForEach-Object { $_.Text }
+            $itemNamesText = $itemNames -join ", "
+            
+            $result = [System.Windows.Forms.MessageBox]::Show(
+                "Apakah Anda yakin ingin menghapus item berikut?`n`n$itemNamesText", 
+                "Konfirmasi Hapus", 
+                [System.Windows.Forms.MessageBoxButtons]::YesNo, 
+                [System.Windows.Forms.MessageBoxIcon]::Question
+            )
+            
+            if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+                if (-not $script:ConfigManager) {
+                    [System.Windows.Forms.MessageBox]::Show("ConfigManager tidak diinisialisasi.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                    return
                 }
 
-                $statusLabel.Text = "Backup $($backupItem.Name) berhasil"
-                $statusLabel.ForeColor = [System.Drawing.Color]::Green
-            }
-            else {
-                $statusLabel.Text = "Backup $($backupItem.Name) gagal: $($result.ErrorMessage)"
-                $statusLabel.ForeColor = [System.Drawing.Color]::Red
+                # Get current backup items
+                $currentItems = $script:ConfigManager.GetBackupItems()
 
-                # Tampilkan error dialog dengan ukuran lebih besar
-                Show-ErrorDialog -title "Backup Gagal" -message "Backup $($backupItem.Name) gagal" -details $result.ErrorMessage
-            }
+                foreach ($selectedItem in $selectedItems) {
+                    $itemToRemove = $selectedItem.Tag
+                    $currentItems = $currentItems | Where-Object { $_.Name -ne $itemToRemove.Name }
+                }
 
-            $progressBar.Value++
-            Start-Sleep -Milliseconds 500
+                # Save using ConfigManager
+                $script:ConfigManager.Config.backup_items = $currentItems
+                $script:ConfigManager.SaveConfiguration()
+
+                Refresh-ListView
+                $statusLabel.Text = "Item berhasil dihapus: $itemNamesText"
+            }
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Pilih item yang akan dihapus terlebih dahulu.", "Peringatan", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
         }
-
-        $progressBar.Visible = $false
-        $btnBackup.Enabled = $true
-        Refresh-ListView
-
-        [System.Windows.Forms.MessageBox]::Show("Backup selesai!", "Selesai", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
     })
 
     $btnRefresh.Add_Click({
-        $config = Get-BackupConfig
         Refresh-ListView
-        $statusLabel.Text = "List refreshed"
+        $statusLabel.Text = "Daftar backup telah diperbarui"
     })
+
+    # Refresh list view
+    function Refresh-ListView {
+        Write-Host "DEBUG: Refresh-ListView called" -ForegroundColor Yellow
+
+        $listView.Items.Clear()
+
+        # Get fresh config data instead of using script variable
+        try {
+            $config = Get-BackupConfig
+            Write-Host "DEBUG: Config loaded with $($config.backup_items.Count) items" -ForegroundColor Yellow
+
+            if ($config.backup_items -and $config.backup_items.Count -gt 0) {
+                foreach ($item in $config.backup_items) {
+                    Write-Host "DEBUG: Processing item: $($item.Name)" -ForegroundColor Yellow
+                    Write-Host "DEBUG: Item SourcePath: '$($item.SourcePath)'" -ForegroundColor Cyan
+
+                    # Check if item properties exist
+                    if (-not $item.Name) {
+                        Write-Host "DEBUG: Item.Name is null, skipping" -ForegroundColor Red
+                        continue
+                    }
+
+                    $listItem = New-Object System.Windows.Forms.ListViewItem
+                    $listItem.Text = $item.Name
+                    $listItem.Tag = $item  # Store the item for later use
+
+                    # Safely add subitems with null checks
+                    $sourcePath = if ($item.SourcePath) { $item.SourcePath } else { "" }
+                    $listItem.SubItems.Add($sourcePath) | Out-Null
+
+                    $destType = if ($item.DestinationType) { $item.DestinationType } else { "GoogleDrive" }
+                    $listItem.SubItems.Add($destType) | Out-Null
+
+                    $itemType = if ($item.IsFolder) { "Folder" } else { "File" }
+                    $listItem.SubItems.Add($itemType) | Out-Null
+
+                    $status = if ($item.Enabled) { "Aktif" } else { "Non-aktif" }
+                    $listItem.SubItems.Add($status) | Out-Null
+
+                    $lastBackup = if ($item.LastBackup) { $item.LastBackup } else { "" }
+                    $listItem.SubItems.Add($lastBackup) | Out-Null
+
+                    $listView.Items.Add($listItem) | Out-Null
+                }
+            } else {
+                Write-Host "DEBUG: No backup items to display" -ForegroundColor Yellow
+            }
+        }
+        catch {
+            Write-Host "DEBUG: Error in Refresh-ListView: $($_.Exception.Message)" -ForegroundColor Red
+        }
+
+        Write-Host "DEBUG: Refresh-ListView completed" -ForegroundColor Yellow
+    }
+
+    # Status label dan progress bar sudah dideklarasikan di awal fungsi
+
+    # Tab Settings
+    $settingsTab = New-Object System.Windows.Forms.TabPage
+    $settingsTab.Text = "Settings"
+    $settingsTab.BackColor = [System.Drawing.Color]::White
+
+    # Google Drive settings
+    $lblClientId = New-Object System.Windows.Forms.Label
+    $lblClientId.Text = "Client ID:"
+    $lblClientId.Location = New-Object System.Drawing.Point(20, 20)
+    $lblClientId.Size = New-Object System.Drawing.Size(100, 20)
+
+    $txtClientId = New-Object System.Windows.Forms.TextBox
+    $txtClientId.Size = New-Object System.Drawing.Size(500, 20)
+    $txtClientId.Location = New-Object System.Drawing.Point(120, 20)
+    $txtClientId.Text = $config.google_drive.client_id
+
+    $lblClientSecret = New-Object System.Windows.Forms.Label
+    $lblClientSecret.Text = "Client Secret:"
+    $lblClientSecret.Location = New-Object System.Drawing.Point(20, 50)
+    $lblClientSecret.Size = New-Object System.Drawing.Size(100, 20)
+
+    $txtClientSecret = New-Object System.Windows.Forms.TextBox
+    $txtClientSecret.Size = New-Object System.Drawing.Size(500, 20)
+    $txtClientSecret.Location = New-Object System.Drawing.Point(120, 50)
+    $txtClientSecret.Text = $config.google_drive.client_secret
+    $txtClientSecret.PasswordChar = "*"
+
+    $btnConnect = New-Object System.Windows.Forms.Button
+    $btnConnect.Text = "Connect to Google Drive"
+    $btnConnect.Size = New-Object System.Drawing.Size(150, 30)
+    $btnConnect.Location = New-Object System.Drawing.Point(120, 80)
+    $btnConnect.BackColor = [System.Drawing.Color]::LightBlue
+
+    $btnSaveSettings = New-Object System.Windows.Forms.Button
+    $btnSaveSettings.Text = "Save Settings"
+    $btnSaveSettings.Size = New-Object System.Drawing.Size(100, 30)
+    $btnSaveSettings.Location = New-Object System.Drawing.Point(280, 80)
 
     $btnConnect.Add_Click({
         if ($txtClientId.Text -and $txtClientSecret.Text) {
@@ -1301,6 +1590,8 @@ function Show-MainForm {
     $scheduleListView.View = [System.Windows.Forms.View]::Details
     $scheduleListView.FullRowSelect = $true
     $scheduleListView.GridLines = $true
+    $scheduleListView.CheckBoxes = $true
+    $scheduleListView.MultiSelect = $true
 
     # Add columns for schedule list
     $scheduleListView.Columns.Add("Task Name", 150) | Out-Null
@@ -1336,6 +1627,13 @@ function Show-MainForm {
     $btnRunNow.Size = New-Object System.Drawing.Size(80, 30)
     $btnRunNow.Location = New-Object System.Drawing.Point(430, 320)
 
+    # Selection status label
+    $selectionStatusLabel = New-Object System.Windows.Forms.Label
+    $selectionStatusLabel.Text = "No tasks selected"
+    $selectionStatusLabel.Size = New-Object System.Drawing.Size(200, 20)
+    $selectionStatusLabel.Location = New-Object System.Drawing.Point(520, 325)
+    $selectionStatusLabel.ForeColor = [System.Drawing.Color]::Blue
+
     # Schedule status label
     $scheduleStatusLabel = New-Object System.Windows.Forms.Label
     $scheduleStatusLabel.Text = "Schedule tasks will appear here"
@@ -1345,12 +1643,43 @@ function Show-MainForm {
     # Function to refresh schedule list
     function Refresh-ScheduleList {
         $scheduleListView.Items.Clear()
-        $config = Get-BackupConfig
+
+        if (-not $script:ConfigManager) {
+            $scheduleStatusLabel.Text = "ConfigManager not initialized"
+            return
+        }
+
+        try {
+            $config = Get-BackupConfig
 
         foreach ($task in $config.scheduled_tasks) {
+            # Skip tasks with empty names
+            if ([string]::IsNullOrWhiteSpace($task.Name)) {
+                continue
+            }
+
+            # Handle both old format (BackupItemName) and new format (BackupItemNames)
+            $backupItemsText = ""
+            $hasBackupItems = $false
+
+            if ($task.BackupItemNames -and $task.BackupItemNames.Count -gt 0) {
+                # New format - array
+                $backupItemsText = $task.BackupItemNames -join ", "
+                $hasBackupItems = $true
+            } elseif ($task.BackupItemName) {
+                # Old format - single string
+                $backupItemsText = $task.BackupItemName
+                $hasBackupItems = $true
+            }
+
+            if (-not $hasBackupItems) {
+                # No backup items configured
+                continue
+            }
+            
             $item = New-Object System.Windows.Forms.ListViewItem
             $item.Text = $task.Name
-            $item.SubItems.Add($task.BackupItemName) | Out-Null
+            $item.SubItems.Add($backupItemsText) | Out-Null
 
             $scheduleTypeText = switch ($task.ScheduleType) {
                 "Daily" { "Daily" }
@@ -1375,7 +1704,16 @@ function Show-MainForm {
             $scheduleListView.Items.Add($item) | Out-Null
         }
 
-        $scheduleStatusLabel.Text = "Total scheduled tasks: $($config.scheduled_tasks.Count)"
+        $validTaskCount = ($config.scheduled_tasks | Where-Object {
+            -not [string]::IsNullOrWhiteSpace($_.Name) -and
+            (($_.BackupItemNames -and $_.BackupItemNames.Count -gt 0) -or $_.BackupItemName)
+        }).Count
+
+        $scheduleStatusLabel.Text = "Total scheduled tasks: $validTaskCount"
+        }
+        catch {
+            $scheduleStatusLabel.Text = "Error loading scheduled tasks: $($_.Exception.Message)"
+        }
     }
 
     # Add Schedule button click
@@ -1383,7 +1721,7 @@ function Show-MainForm {
         # Show add schedule dialog
         $scheduleForm = New-Object System.Windows.Forms.Form
         $scheduleForm.Text = "Add Scheduled Task"
-        $scheduleForm.Size = New-Object System.Drawing.Size(500, 400)
+        $scheduleForm.Size = New-Object System.Drawing.Size(500, 450)
         $scheduleForm.StartPosition = "CenterScreen"
 
         # Task Name
@@ -1396,39 +1734,43 @@ function Show-MainForm {
         $txtTaskName.Size = New-Object System.Drawing.Size(300, 20)
         $txtTaskName.Location = New-Object System.Drawing.Point(120, 20)
 
-        # Backup Item Selection
+        # Backup Item Selection (Multi-select)
         $lblBackupItem = New-Object System.Windows.Forms.Label
-        $lblBackupItem.Text = "Backup Item:"
+        $lblBackupItem.Text = "Backup Items:"
         $lblBackupItem.Location = New-Object System.Drawing.Point(20, 50)
         $lblBackupItem.Size = New-Object System.Drawing.Size(100, 20)
 
-        $cboBackupItem = New-Object System.Windows.Forms.ComboBox
-        $cboBackupItem.Size = New-Object System.Drawing.Size(300, 20)
-        $cboBackupItem.Location = New-Object System.Drawing.Point(120, 50)
-        $cboBackupItem.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        $clbBackupItems = New-Object System.Windows.Forms.CheckedListBox
+        $clbBackupItems.Size = New-Object System.Drawing.Size(300, 80)
+        $clbBackupItems.Location = New-Object System.Drawing.Point(120, 50)
+        $clbBackupItems.CheckOnClick = $true
 
-        # Populate backup items
+        # Populate backup items with only enabled items
         $config = Get-BackupConfig
-        foreach ($item in $config.backup_items) {
-            $cboBackupItem.Items.Add($item.Name) | Out-Null
+        if ($config -and $config.backup_items) {
+            foreach ($item in $config.backup_items) {
+                if ($item -and $item.Name -and $item.Enabled -eq $true) {
+                    $clbBackupItems.Items.Add($item.Name) | Out-Null
+                }
+            }
         }
 
         # Schedule Type
         $lblScheduleType = New-Object System.Windows.Forms.Label
         $lblScheduleType.Text = "Schedule Type:"
-        $lblScheduleType.Location = New-Object System.Drawing.Point(20, 80)
+        $lblScheduleType.Location = New-Object System.Drawing.Point(20, 140)
         $lblScheduleType.Size = New-Object System.Drawing.Size(100, 20)
 
         $cboScheduleType = New-Object System.Windows.Forms.ComboBox
         $cboScheduleType.Size = New-Object System.Drawing.Size(300, 20)
-        $cboScheduleType.Location = New-Object System.Drawing.Point(120, 80)
+        $cboScheduleType.Location = New-Object System.Drawing.Point(120, 140)
         $cboScheduleType.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
         $cboScheduleType.Items.AddRange(@("Daily", "Weekly", "Monthly")) | Out-Null
 
         # Schedule Settings Panel
         $pnlScheduleSettings = New-Object System.Windows.Forms.Panel
         $pnlScheduleSettings.Size = New-Object System.Drawing.Size(400, 150)
-        $pnlScheduleSettings.Location = New-Object System.Drawing.Point(20, 110)
+        $pnlScheduleSettings.Location = New-Object System.Drawing.Point(20, 170)
         $pnlScheduleSettings.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
 
         # Time picker
@@ -1512,22 +1854,41 @@ function Show-MainForm {
         $btnOK = New-Object System.Windows.Forms.Button
         $btnOK.Text = "OK"
         $btnOK.Size = New-Object System.Drawing.Size(75, 30)
-        $btnOK.Location = New-Object System.Drawing.Point(200, 330)
+        $btnOK.Location = New-Object System.Drawing.Point(200, 380)
         $btnOK.DialogResult = [System.Windows.Forms.DialogResult]::OK
 
         $btnCancel = New-Object System.Windows.Forms.Button
         $btnCancel.Text = "Cancel"
         $btnCancel.Size = New-Object System.Drawing.Size(75, 30)
-        $btnCancel.Location = New-Object System.Drawing.Point(290, 330)
+        $btnCancel.Location = New-Object System.Drawing.Point(290, 380)
         $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 
         # Add controls to form
-        $scheduleForm.Controls.AddRange(@($lblTaskName, $txtTaskName, $lblBackupItem, $cboBackupItem, $lblScheduleType, $cboScheduleType, $pnlScheduleSettings, $btnOK, $btnCancel))
+        $scheduleForm.Controls.AddRange(@($lblTaskName, $txtTaskName, $lblBackupItem, $clbBackupItems, $lblScheduleType, $cboScheduleType, $pnlScheduleSettings, $btnOK, $btnCancel))
 
         # Show form
         $result = $scheduleForm.ShowDialog()
 
         if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+            # Get selected backup items
+            $selectedBackupItems = @()
+            for ($i = 0; $i -lt $clbBackupItems.Items.Count; $i++) {
+                if ($clbBackupItems.GetItemChecked($i)) {
+                    $selectedBackupItems += $clbBackupItems.Items[$i]
+                }
+            }
+
+            # Validate input
+            if (-not $txtTaskName.Text) {
+                [System.Windows.Forms.MessageBox]::Show("Silakan masukkan nama task.", "Validasi", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+
+            if ($selectedBackupItems.Count -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show("Silakan pilih minimal satu item backup.", "Validasi", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+
             # Create new scheduled task
             $scheduleSettings = @{
                 Time = $dtpTime.Value.ToString("HH:mm")
@@ -1542,15 +1903,25 @@ function Show-MainForm {
                 }
             }
 
-            $newTask = New-ScheduledTask -name $txtTaskName.Text -backupItemName $cboBackupItem.SelectedItem.ToString() -scheduleType $cboScheduleType.SelectedItem.ToString() -scheduleSettings $scheduleSettings
+            $newTask = New-ScheduledTask -name $txtTaskName.Text -backupItemNames $selectedBackupItems -scheduleType $cboScheduleType.SelectedItem.ToString() -scheduleSettings $scheduleSettings
 
-            # Add to config
-            $config.scheduled_tasks += $newTask
-            Save-BackupConfig $config
+            # Add to config using ConfigManager
+            if (-not $script:ConfigManager) {
+                [System.Windows.Forms.MessageBox]::Show("ConfigManager tidak diinisialisasi.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                return
+            }
+
+            $currentConfig = Get-BackupConfig
+            $newTasks = @()
+            $newTasks += $currentConfig.scheduled_tasks
+            $newTasks += $newTask
+
+            $script:ConfigManager.Config.scheduled_tasks = $newTasks
+            $script:ConfigManager.SaveConfiguration()
 
             # Register Windows scheduled task
             $taskName = "Backup_$($newTask.Name)"
-            $scriptPath = Join-Path $scriptPath "Run_Scheduled_Backup.ps1"
+            $scriptPath = Join-Path $PSScriptRoot "Run_Scheduled_Backup.ps1"
             Register-WindowsScheduledTask -taskName $taskName -scriptPath $scriptPath -scheduleType $newTask.ScheduleType -settings $newTask.Settings
 
             Refresh-ScheduleList
@@ -1559,41 +1930,677 @@ function Show-MainForm {
         }
     })
 
-    # Add controls to schedule tab
-    $scheduleTab.Controls.AddRange(@($scheduleListView, $btnAddSchedule, $btnEditSchedule, $btnRemoveSchedule, $btnEnableDisable, $btnRunNow, $scheduleStatusLabel))
+    # Script-level timer variable to prevent multiple instances
+    $script:selectionUpdateTimer = $null
+
+    # Event handler for checkbox changes to update selection status
+    $scheduleListView.Add_ItemCheck({
+        param($sender, $e)
+        
+        # Stop and dispose existing timer if it exists
+        if ($script:selectionUpdateTimer -ne $null) {
+            try {
+                $script:selectionUpdateTimer.Stop()
+                $script:selectionUpdateTimer.Dispose()
+            } catch {
+                # Ignore disposal errors
+            }
+            $script:selectionUpdateTimer = $null
+        }
+        
+        # Use a timer to delay the update since ItemCheck fires before the check state changes
+        $script:selectionUpdateTimer = New-Object System.Windows.Forms.Timer
+        $script:selectionUpdateTimer.Interval = 10
+        $script:selectionUpdateTimer.Add_Tick({
+            $checkedCount = 0
+            foreach ($item in $scheduleListView.Items) {
+                if ($item.Checked) {
+                    $checkedCount++
+                }
+            }
+            
+            if ($checkedCount -eq 0) {
+                $selectionStatusLabel.Text = "No tasks selected"
+                $selectionStatusLabel.ForeColor = [System.Drawing.Color]::Gray
+            } elseif ($checkedCount -eq 1) {
+                $selectionStatusLabel.Text = "1 task selected"
+                $selectionStatusLabel.ForeColor = [System.Drawing.Color]::Blue
+            } else {
+                $selectionStatusLabel.Text = "$checkedCount tasks selected"
+                $selectionStatusLabel.ForeColor = [System.Drawing.Color]::Blue
+            }
+            
+            # Safely stop and dispose timer
+            if ($script:selectionUpdateTimer -ne $null) {
+                try {
+                    $script:selectionUpdateTimer.Stop()
+                    $script:selectionUpdateTimer.Dispose()
+                } catch {
+                    # Ignore disposal errors
+                }
+                $script:selectionUpdateTimer = $null
+            }
+        })
+        $script:selectionUpdateTimer.Start()
+    })
+
+    # Event handler for Run Now button
+    $btnRunNow.Add_Click({
+        # Get checked items first, then fall back to selected items
+        $selectedItems = @()
+        
+        # First, try to get checked items
+        foreach ($item in $scheduleListView.Items) {
+            if ($item.Checked) {
+                $selectedItems += $item
+            }
+        }
+        
+        # If no checked items, try selected items
+        if ($selectedItems.Count -eq 0) {
+            foreach ($item in $scheduleListView.SelectedItems) {
+                $selectedItems += $item
+            }
+        }
+        
+        if ($selectedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Silakan pilih atau centang tugas yang ingin dijalankan sekarang.", "Tidak Ada Tugas Dipilih", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+
+        # Confirm before running
+        $taskNames = ($selectedItems | ForEach-Object { $_.Text }) -join ", "
+        $confirmMessage = if ($selectedItems.Count -eq 1) {
+            "Apakah Anda yakin ingin menjalankan tugas '$taskNames' sekarang?"
+        } else {
+            "Apakah Anda yakin ingin menjalankan $($selectedItems.Count) tugas sekarang?`n`nTugas: $taskNames"
+        }
+        
+        $result = [System.Windows.Forms.MessageBox]::Show($confirmMessage, "Konfirmasi Run Now", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            $config = Get-BackupConfig
+            $successCount = 0
+            $failCount = 0
+            $errorMessages = @()
+            
+            foreach ($selectedItem in $selectedItems) {
+                $taskName = $selectedItem.Text
+                
+                try {
+                    $scheduleStatusLabel.Text = "Menjalankan tugas '$taskName'..."
+                    $scheduleStatusLabel.Refresh()
+                    
+                    # Find the task
+                    $task = $config.scheduled_tasks | Where-Object { $_.Name -eq $taskName }
+                    
+                    if (-not $task) {
+                        $errorMessages += "Tugas '$taskName' tidak ditemukan dalam konfigurasi"
+                        $failCount++
+                        continue
+                    }
+
+                    # Get backup items for this task (handle both old and new format)
+                    $backupItemNames = @()
+                    if ($task.BackupItemNames -and $task.BackupItemNames.Count -gt 0) {
+                        # New format - array
+                        $backupItemNames = $task.BackupItemNames
+                    } elseif ($task.BackupItemName) {
+                        # Old format - single string
+                        $backupItemNames = @($task.BackupItemName)
+                    }
+
+                    if ($backupItemNames.Count -eq 0) {
+                        $errorMessages += "Tugas '$taskName' tidak memiliki item backup yang dikonfigurasi"
+                        $failCount++
+                        continue
+                    }
+
+                    # Process each backup item in the task
+                    $taskSuccess = $true
+                    $taskErrors = @()
+
+                    foreach ($backupItemName in $backupItemNames) {
+                        # Find the backup item
+                        $backupItem = $config.backup_items | Where-Object { $_.Name -eq $backupItemName }
+                        
+                        if (-not $backupItem) {
+                            $taskErrors += "Item backup '$backupItemName' tidak ditemukan"
+                            $taskSuccess = $false
+                            continue
+                        }
+                        
+                        # Run the backup for this item
+                        try {
+                            $backupResult = Backup-Item -backupItem $backupItem
+
+                            if (-not $backupResult.Success) {
+                                $taskErrors += "Backup '$backupItemName': $($backupResult.ErrorMessage)"
+                                $taskSuccess = $false
+                            }
+                        } catch {
+                            $errorMsg = "Backup '$backupItemName': " + $_.Exception.Message
+                            $taskErrors += $errorMsg
+                            $taskSuccess = $false
+                        }
+                    }
+                    
+                    if ($taskSuccess) {
+                        $successCount++
+                    } else {
+                        $failCount++
+                        $errorMessages += "Tugas '$taskName': " + ($taskErrors -join "; ")
+                    }
+                } catch {
+                    $failCount++
+                    $errorMsg = "Tugas '$taskName': " + $_.Exception.Message
+                    $errorMessages += $errorMsg
+                }
+            }
+            
+            # Show summary
+            $summaryMessage = "Hasil eksekusi:`n"
+            $summaryMessage += "Berhasil: $successCount tugas`n"
+            $summaryMessage += "Gagal: $failCount tugas"
+            
+            if ($errorMessages.Count -gt 0) {
+                $summaryMessage += "`n`nDetail error:`n" + ($errorMessages -join "`n")
+            }
+            
+            $scheduleStatusLabel.Text = "Selesai: $successCount berhasil, $failCount gagal"
+            
+            $messageType = if ($failCount -eq 0) { 
+                [System.Windows.Forms.MessageBoxIcon]::Information 
+            } elseif ($successCount -eq 0) { 
+                [System.Windows.Forms.MessageBoxIcon]::Error 
+            } else { 
+                [System.Windows.Forms.MessageBoxIcon]::Warning 
+            }
+            
+            [System.Windows.Forms.MessageBox]::Show($summaryMessage, "Hasil Run Now", [System.Windows.Forms.MessageBoxButtons]::OK, $messageType)
+        }
+    })
+
+    # Event handler for Edit Schedule button
+    $btnEditSchedule.Add_Click({
+        $selectedItems = $scheduleListView.SelectedItems
+        if ($selectedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Silakan pilih jadwal yang ingin diedit.", "Tidak Ada Jadwal Dipilih", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+        
+        if ($selectedItems.Count -gt 1) {
+            [System.Windows.Forms.MessageBox]::Show("Silakan pilih hanya satu jadwal untuk diedit.", "Terlalu Banyak Jadwal Dipilih", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+
+        $selectedItem = $selectedItems[0]
+        $taskName = $selectedItem.Text
+        
+        # Find the task in configuration
+        $config = Get-BackupConfig
+        $task = $config.scheduled_tasks | Where-Object { $_.Name -eq $taskName }
+        
+        if (-not $task) {
+            [System.Windows.Forms.MessageBox]::Show("Jadwal '$taskName' tidak ditemukan dalam konfigurasi.", "Jadwal Tidak Ditemukan", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            return
+        }
+
+        # Show edit form with existing values
+        $editForm = New-Object System.Windows.Forms.Form
+        $editForm.Text = "Edit Scheduled Task"
+        $editForm.Size = New-Object System.Drawing.Size(500, 450)
+        $editForm.StartPosition = "CenterScreen"
+
+        # Task Name
+        $lblTaskName = New-Object System.Windows.Forms.Label
+        $lblTaskName.Text = "Task Name:"
+        $lblTaskName.Location = New-Object System.Drawing.Point(20, 20)
+        $lblTaskName.Size = New-Object System.Drawing.Size(100, 20)
+
+        $txtTaskName = New-Object System.Windows.Forms.TextBox
+        $txtTaskName.Size = New-Object System.Drawing.Size(300, 20)
+        $txtTaskName.Location = New-Object System.Drawing.Point(120, 20)
+        $txtTaskName.Text = $task.Name
+
+        # Backup Item Selection (Multi-select)
+        $lblBackupItem = New-Object System.Windows.Forms.Label
+        $lblBackupItem.Text = "Backup Items:"
+        $lblBackupItem.Location = New-Object System.Drawing.Point(20, 50)
+        $lblBackupItem.Size = New-Object System.Drawing.Size(100, 20)
+
+        $clbBackupItems = New-Object System.Windows.Forms.CheckedListBox
+        $clbBackupItems.Size = New-Object System.Drawing.Size(300, 80)
+        $clbBackupItems.Location = New-Object System.Drawing.Point(120, 50)
+        $clbBackupItems.CheckOnClick = $true
+
+        # Populate backup items with only enabled items
+        $config = Get-BackupConfig
+        if ($config -and $config.backup_items) {
+            foreach ($item in $config.backup_items) {
+                if ($item -and $item.Name -and $item.Enabled -eq $true) {
+                    $index = $clbBackupItems.Items.Add($item.Name)
+                    # Check if this item is in the task
+                    if ($task.BackupItemNames -contains $item.Name) {
+                        $clbBackupItems.SetItemChecked($index, $true)
+                    }
+                }
+            }
+        }
+
+        # Schedule Type
+        $lblScheduleType = New-Object System.Windows.Forms.Label
+        $lblScheduleType.Text = "Schedule Type:"
+        $lblScheduleType.Location = New-Object System.Drawing.Point(20, 140)
+        $lblScheduleType.Size = New-Object System.Drawing.Size(100, 20)
+
+        $cboScheduleType = New-Object System.Windows.Forms.ComboBox
+        $cboScheduleType.Size = New-Object System.Drawing.Size(300, 20)
+        $cboScheduleType.Location = New-Object System.Drawing.Point(120, 140)
+        $cboScheduleType.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        $cboScheduleType.Items.AddRange(@("Daily", "Weekly", "Monthly")) | Out-Null
+        $cboScheduleType.SelectedItem = $task.ScheduleType
+
+        # Schedule Settings Panel
+        $pnlScheduleSettings = New-Object System.Windows.Forms.Panel
+        $pnlScheduleSettings.Size = New-Object System.Drawing.Size(400, 150)
+        $pnlScheduleSettings.Location = New-Object System.Drawing.Point(20, 170)
+        $pnlScheduleSettings.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+
+        # Time picker
+        $lblTime = New-Object System.Windows.Forms.Label
+        $lblTime.Text = "Time:"
+        $lblTime.Location = New-Object System.Drawing.Point(10, 20)
+        $lblTime.Size = New-Object System.Drawing.Size(50, 20)
+
+        $dtpTime = New-Object System.Windows.Forms.DateTimePicker
+        $dtpTime.Size = New-Object System.Drawing.Size(100, 20)
+        $dtpTime.Location = New-Object System.Drawing.Point(70, 20)
+        $dtpTime.Format = [System.Windows.Forms.DateTimePickerFormat]::Time
+        if ($task.Settings.Time) {
+            $dtpTime.Value = [DateTime]::Parse($task.Settings.Time)
+        } else {
+            $dtpTime.Value = Get-Date -Hour 9 -Minute 0 -Second 0
+        }
+
+        # Day of Week (for Weekly)
+        $lblDayOfWeek = New-Object System.Windows.Forms.Label
+        $lblDayOfWeek.Text = "Day of Week:"
+        $lblDayOfWeek.Location = New-Object System.Drawing.Point(10, 50)
+        $lblDayOfWeek.Size = New-Object System.Drawing.Size(100, 20)
+
+        $cboDayOfWeek = New-Object System.Windows.Forms.ComboBox
+        $cboDayOfWeek.Size = New-Object System.Drawing.Size(150, 20)
+        $cboDayOfWeek.Location = New-Object System.Drawing.Point(120, 50)
+        $cboDayOfWeek.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        $cboDayOfWeek.Items.AddRange(@([System.DayOfWeek]::Monday, [System.DayOfWeek]::Tuesday, [System.DayOfWeek]::Wednesday, [System.DayOfWeek]::Thursday, [System.DayOfWeek]::Friday, [System.DayOfWeek]::Saturday, [System.DayOfWeek]::Sunday)) | Out-Null
+        if ($task.Settings.DayOfWeek) {
+            $cboDayOfWeek.SelectedIndex = $task.Settings.DayOfWeek
+        } else {
+            $cboDayOfWeek.SelectedIndex = 0
+        }
+
+        # Day of Month (for Monthly)
+        $lblDayOfMonth = New-Object System.Windows.Forms.Label
+        $lblDayOfMonth.Text = "Day of Month:"
+        $lblDayOfMonth.Location = New-Object System.Drawing.Point(10, 80)
+        $lblDayOfMonth.Size = New-Object System.Drawing.Size(100, 20)
+
+        $numDayOfMonth = New-Object System.Windows.Forms.NumericUpDown
+        $numDayOfMonth.Size = New-Object System.Drawing.Size(60, 20)
+        $numDayOfMonth.Location = New-Object System.Drawing.Point(120, 80)
+        $numDayOfMonth.Minimum = 1
+        $numDayOfMonth.Maximum = 31
+        if ($task.Settings.DayOfMonth) {
+            $numDayOfMonth.Value = $task.Settings.DayOfMonth
+        } else {
+            $numDayOfMonth.Value = 1
+        }
+
+        # Enabled checkbox
+        $chkEnabled = New-Object System.Windows.Forms.CheckBox
+        $chkEnabled.Text = "Enabled"
+        $chkEnabled.Location = New-Object System.Drawing.Point(120, 330)
+        $chkEnabled.Size = New-Object System.Drawing.Size(100, 20)
+        $chkEnabled.Checked = $task.Enabled
+
+        # Add controls to settings panel
+        $pnlScheduleSettings.Controls.AddRange(@($lblTime, $dtpTime, $lblDayOfWeek, $cboDayOfWeek, $lblDayOfMonth, $numDayOfMonth))
+
+        # Initially hide day controls
+        $lblDayOfWeek.Visible = $false
+        $cboDayOfWeek.Visible = $false
+        $lblDayOfMonth.Visible = $false
+        $numDayOfMonth.Visible = $false
+
+        # Schedule type change handler
+        $cboScheduleType.Add_SelectedIndexChanged({
+            switch ($cboScheduleType.SelectedItem.ToString()) {
+                "Daily" {
+                    $lblTime.Visible = $true
+                    $dtpTime.Visible = $true
+                    $lblDayOfWeek.Visible = $false
+                    $cboDayOfWeek.Visible = $false
+                    $lblDayOfMonth.Visible = $false
+                    $numDayOfMonth.Visible = $false
+                }
+                "Weekly" {
+                    $lblTime.Visible = $true
+                    $dtpTime.Visible = $true
+                    $lblDayOfWeek.Visible = $true
+                    $cboDayOfWeek.Visible = $true
+                    $lblDayOfMonth.Visible = $false
+                    $numDayOfMonth.Visible = $false
+                }
+                "Monthly" {
+                    $lblTime.Visible = $true
+                    $dtpTime.Visible = $true
+                    $lblDayOfWeek.Visible = $false
+                    $cboDayOfWeek.Visible = $false
+                    $lblDayOfMonth.Visible = $true
+                    $numDayOfMonth.Visible = $true
+                }
+            }
+        })
+
+        # Set initial visibility based on current schedule type
+        switch ($task.ScheduleType) {
+            "Weekly" {
+                $lblDayOfWeek.Visible = $true
+                $cboDayOfWeek.Visible = $true
+            }
+            "Monthly" {
+                $lblDayOfMonth.Visible = $true
+                $numDayOfMonth.Visible = $true
+            }
+        }
+
+        # Buttons
+        $btnOK = New-Object System.Windows.Forms.Button
+        $btnOK.Text = "OK"
+        $btnOK.Size = New-Object System.Drawing.Size(75, 30)
+        $btnOK.Location = New-Object System.Drawing.Point(200, 380)
+        $btnOK.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+        $btnCancel = New-Object System.Windows.Forms.Button
+        $btnCancel.Text = "Cancel"
+        $btnCancel.Size = New-Object System.Drawing.Size(75, 30)
+        $btnCancel.Location = New-Object System.Drawing.Point(290, 380)
+        $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+
+        # Add controls to form
+        $editForm.Controls.AddRange(@($lblTaskName, $txtTaskName, $lblBackupItem, $clbBackupItems, $lblScheduleType, $cboScheduleType, $pnlScheduleSettings, $chkEnabled, $btnOK, $btnCancel))
+
+        # Show form
+        $result = $editForm.ShowDialog()
+
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+            # Get selected backup items
+            $selectedBackupItems = @()
+            for ($i = 0; $i -lt $clbBackupItems.Items.Count; $i++) {
+                if ($clbBackupItems.GetItemChecked($i)) {
+                    $selectedBackupItems += $clbBackupItems.Items[$i]
+                }
+            }
+
+            if ($selectedBackupItems.Count -eq 0) {
+                [System.Windows.Forms.MessageBox]::Show("Silakan pilih minimal satu item backup untuk dijadwalkan.", "Tidak Ada Item Backup Dipilih", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+                return
+            }
+
+            try {
+                # Update the existing task
+                $task.Name = $txtTaskName.Text
+                $task.BackupItemNames = $selectedBackupItems
+                $task.ScheduleType = $cboScheduleType.SelectedItem.ToString()
+                $task.Enabled = $chkEnabled.Checked
+
+                # Create schedule settings
+                $scheduleSettings = @{
+                    Time = $dtpTime.Value.ToString("HH:mm")
+                }
+
+                switch ($cboScheduleType.SelectedItem.ToString()) {
+                    "Weekly" {
+                        $scheduleSettings.DayOfWeek = [int]$cboDayOfWeek.SelectedItem
+                    }
+                    "Monthly" {
+                        $scheduleSettings.DayOfMonth = [int]$numDayOfMonth.Value
+                    }
+                }
+
+                $task.Settings = $scheduleSettings
+                $task.NextRun = Get-NextRunTime -scheduleType $task.ScheduleType -settings $task.Settings
+
+                # Save configuration using ConfigManager
+                if (-not $script:ConfigManager) {
+                    [System.Windows.Forms.MessageBox]::Show("ConfigManager tidak diinisialisasi.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                    return
+                }
+
+                # Update the task in the configuration using ConfigManager
+                $currentTasks = $script:ConfigManager.GetScheduledTasks()
+                $updatedTasks = @()
+
+                # Find and update the task
+                foreach ($currentTask in $currentTasks) {
+                    if ($currentTask.Name -eq $task.Name) {
+                        # Update with new values
+                        $currentTask.Name = $txtTaskName.Text
+                        $currentTask.BackupItemNames = $selectedBackupItems
+                        $currentTask.ScheduleType = $cboScheduleType.SelectedItem.ToString()
+                        $currentTask.Enabled = $chkEnabled.Checked
+                        $currentTask.Settings = $scheduleSettings
+                        $currentTask.NextRun = Get-NextRunTime -scheduleType $currentTask.ScheduleType -settings $currentTask.Settings
+                    }
+                    $updatedTasks += $currentTask
+                }
+
+                $script:ConfigManager.Config.scheduled_tasks = $updatedTasks
+                $script:ConfigManager.SaveConfiguration()
+
+                # Re-register the Windows scheduled task
+                $windowsTaskName = "Backup_$($task.Name)"
+                $scriptPath = Join-Path $PSScriptRoot "Run_Scheduled_Backup.ps1"
+                Unregister-WindowsScheduledTask -taskName $windowsTaskName
+                Register-WindowsScheduledTask -taskName $windowsTaskName -scriptPath $scriptPath -scheduleType $task.ScheduleType -settings $task.Settings
+
+                # Refresh the schedule list
+                Refresh-ScheduleList
+                
+                # Update status
+                $scheduleStatusLabel.Text = "Jadwal '$($result.TaskName)' berhasil diperbarui"
+                
+                [System.Windows.Forms.MessageBox]::Show("Jadwal '$($result.TaskName)' berhasil diperbarui.", "Jadwal Diperbarui", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            } catch {
+                $errorMsg = "Gagal memperbarui jadwal: " + $_.Exception.Message
+                Write-Log $errorMsg "ERROR"
+                $scheduleStatusLabel.Text = "Gagal memperbarui jadwal"
+                [System.Windows.Forms.MessageBox]::Show($errorMsg, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            }
+        }
+    })
+
+    # Event handler for Delete Schedule button
+    $btnRemoveSchedule.Add_Click({
+        $selectedItems = $scheduleListView.SelectedItems
+        if ($selectedItems.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show("Silakan pilih jadwal yang ingin dihapus.", "Tidak Ada Jadwal Dipilih", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            return
+        }
+
+        # Confirm deletion
+        $taskNames = ($selectedItems | ForEach-Object { $_.Text }) -join ", "
+        $confirmMessage = if ($selectedItems.Count -eq 1) {
+            "Apakah Anda yakin ingin menghapus jadwal '$taskNames'?"
+        } else {
+            "Apakah Anda yakin ingin menghapus $($selectedItems.Count) jadwal?`n`nJadwal: $taskNames"
+        }
+        
+        $result = [System.Windows.Forms.MessageBox]::Show($confirmMessage, "Konfirmasi Hapus Jadwal", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+        
+        if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
+            $config = Get-BackupConfig
+            $deletedCount = 0
+            $errorMessages = @()
+            
+            foreach ($selectedItem in $selectedItems) {
+                $taskName = $selectedItem.Text
+                
+                try {
+                    # Find and remove from configuration
+                    $taskIndex = -1
+                    for ($i = 0; $i -lt $config.scheduled_tasks.Count; $i++) {
+                        if ($config.scheduled_tasks[$i].Name -eq $taskName) {
+                            $taskIndex = $i
+                            break
+                        }
+                    }
+                    
+                    if ($taskIndex -ge 0) {
+                        # Remove from configuration
+                        $config.scheduled_tasks = $config.scheduled_tasks | Where-Object { $_.Name -ne $taskName }
+                        
+                        # Remove Windows scheduled task
+                        try {
+                            Unregister-ScheduledTask -TaskName "AutoBackup_$taskName" -Confirm:$false -ErrorAction SilentlyContinue
+                        } catch {
+                            # Log but don't fail if Windows task doesn't exist
+                            Write-Log "Warning: Could not remove Windows scheduled task for '$taskName': $($_.Exception.Message)" "WARNING"
+                        }
+                        
+                        $deletedCount++
+                    } else {
+                        $errorMessages += "Jadwal '$taskName' tidak ditemukan dalam konfigurasi"
+                    }
+                } catch {
+                    $errorMessages += "Gagal menghapus jadwal '$taskName': $($_.Exception.Message)"
+                }
+            }
+            
+            if ($deletedCount -gt 0) {
+                # Save configuration using ConfigManager
+                if (-not $script:ConfigManager) {
+                    [System.Windows.Forms.MessageBox]::Show("ConfigManager tidak diinisialisasi.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+                    return
+                }
+
+                # Update tasks using ConfigManager
+                $script:ConfigManager.Config.scheduled_tasks = $config.scheduled_tasks
+                $script:ConfigManager.SaveConfiguration()
+                
+                # Refresh the schedule list
+                Refresh-ScheduleList
+            }
+            
+            # Show result
+            if ($errorMessages.Count -eq 0) {
+                $scheduleStatusLabel.Text = "$deletedCount jadwal berhasil dihapus"
+                [System.Windows.Forms.MessageBox]::Show("$deletedCount jadwal berhasil dihapus.", "Jadwal Dihapus", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
+            } else {
+                $scheduleStatusLabel.Text = "Beberapa jadwal gagal dihapus"
+                $errorMsg = "Berhasil menghapus: $deletedCount jadwal`n`nError:`n" + ($errorMessages -join "`n")
+                [System.Windows.Forms.MessageBox]::Show($errorMsg, "Hasil Hapus Jadwal", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+            }
+        }
+    })
+
+    # Add controls to schedule tab (with null checks)
+    $scheduleControls = @($scheduleListView, $btnAddSchedule, $btnEditSchedule, $btnRemoveSchedule, $btnEnableDisable, $btnRunNow, $selectionStatusLabel, $scheduleStatusLabel)
+    $scheduleControls = $scheduleControls | Where-Object { $_ -ne $null }
+    if ($scheduleControls.Count -gt 0) {
+        $scheduleTab.Controls.AddRange($scheduleControls)
+    }
 
     # Initial refresh of schedule list
     Refresh-ScheduleList
 
-    # Add controls to tabs
-    $backupTab.Controls.AddRange(@($listView, $btnAdd, $btnRemove, $btnBackup, $btnRefresh, $statusLabel, $progressBar))
-    $settingsTab.Controls.AddRange(@($lblClientId, $txtClientId, $lblClientSecret, $txtClientSecret, $btnConnect, $btnSaveSettings))
+    # Add controls to tabs (with null checks)
+    $backupControls = @($listView, $btnAdd, $btnEdit, $btnRemove, $btnBackup, $btnRefresh)
+    $backupControls = $backupControls | Where-Object { $_ -ne $null }
+    if ($backupControls.Count -gt 0) {
+        $backupTab.Controls.AddRange($backupControls)
+    }
 
-    $tabControl.Controls.AddRange(@($backupTab, $settingsTab, $scheduleTab))
+    $settingsControls = @($lblClientId, $txtClientId, $lblClientSecret, $txtClientSecret, $btnConnect, $btnSaveSettings)
+    $settingsControls = $settingsControls | Where-Object { $_ -ne $null }
+    if ($settingsControls.Count -gt 0) {
+        $settingsTab.Controls.AddRange($settingsControls)
+    }
 
-    # Add controls to main form
-    $mainForm.Controls.Add($tabControl)
+    $tabControls = @($backupTab, $settingsTab, $scheduleTab)
+    $tabControls = $tabControls | Where-Object { $_ -ne $null }
+    if ($tabControls.Count -gt 0) {
+        $tabControl.Controls.AddRange($tabControls)
+    }
+
+    # Add controls to main form (with null check)
+    if ($tabControl -ne $null) {
+        $mainForm.Controls.Add($tabControl)
+    }
+
+    # Add status label and progress bar to main form
+    if ($statusLabel -ne $null) {
+        $mainForm.Controls.Add($statusLabel)
+    }
+    if ($progressBar -ne $null) {
+        $mainForm.Controls.Add($progressBar)
+    }
 
     # Initial load
     Refresh-ListView
 
     # Show form
+    Write-Host "DEBUG: About to show form with ShowDialog()" -ForegroundColor Yellow
     $mainForm.Add_Shown({ $mainForm.Activate() })
+    Write-Host "DEBUG: Calling ShowDialog()..." -ForegroundColor Yellow
     [void]$mainForm.ShowDialog()
+    Write-Host "DEBUG: ShowDialog() returned" -ForegroundColor Yellow
 }
 
 # Main execution
 function main {
-    # Buat direktori yang diperlukan
-    $directories = @("config", "logs", "temp")
-    foreach ($dir in $directories) {
-        if (-not (Test-Path $dir)) {
-            New-Item -ItemType Directory -Path $dir -Force | Out-Null
-        }
-    }
+    Write-Host "DEBUG: Main function started" -ForegroundColor Green
+    try {
+        Write-Host "DEBUG: Initializing ConfigManager..." -ForegroundColor Green
+        # Initialize ConfigManager with correct base path
+        $script:ConfigManager = [ConfigManager]::new($PSScriptRoot)
+        Write-Log "ConfigManager initialized successfully" "INFO"
 
-    # Tampilkan GUI
-    Show-MainForm
+        Write-Host "DEBUG: Initializing AuthManager..." -ForegroundColor Green
+        # Initialize AuthManager
+        $script:AuthManager = New-GoogleDriveAuthManager -ConfigManager $script:ConfigManager
+        Write-Log "AuthManager initialized successfully" "INFO"
+
+        # Setup logging system for AuthManager
+        $script:AuthManager.SetLoggingSystem($script:ConfigManager)
+
+        Write-Host "DEBUG: Loading configuration..." -ForegroundColor Green
+        # Load initial configuration
+        $config = Get-BackupConfig
+        if (-not $config) {
+            Write-Log "Failed to load initial configuration" "ERROR"
+            [System.Windows.Forms.MessageBox]::Show("Failed to load configuration. Check logs for details.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            return
+        }
+
+        Write-Log "Application initialized successfully" "INFO"
+        Write-Log "Backup items loaded: $($config.backup_items.Count)" "INFO"
+        Write-Log "Scheduled tasks loaded: $($config.scheduled_tasks.Count)" "INFO"
+        Write-Log "Config file: $($script:ConfigManager.GetConfigFilePath())" "INFO"
+
+        Write-Host "DEBUG: About to call Show-MainForm..." -ForegroundColor Green
+        # Tampilkan GUI
+        Show-MainForm
+        Write-Host "DEBUG: Show-MainForm returned" -ForegroundColor Green
+    }
+    catch {
+        $errorMsg = "Failed to initialize application: " + $_.Exception.Message
+        Write-Host "DEBUG: Exception caught in main: $errorMsg" -ForegroundColor Red
+        Write-Host "DEBUG: Exception details: $($_.Exception)" -ForegroundColor Red
+        Write-Log $errorMsg "ERROR"
+        [System.Windows.Forms.MessageBox]::Show($errorMsg, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+    }
 }
 
 # Jalankan aplikasi
