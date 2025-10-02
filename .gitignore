@@ -1,0 +1,33 @@
+# Log files
+*.log
+logs/
+program_files/logs/
+
+# Temporary files and directories
+temp/
+program_files/temp/
+program_files/temp_backup_files/
+program_files/temp_backups/
+
+# Runtime data
+program_files/data/
+program_files/history/
+program_files/riwayat_backup/
+program_files/riwayat_upload/
+
+# Authentication files (for security)
+program_files/auth/token.json
+program_files/auth/token.json.backup
+program_files/auth/token_*.json
+
+# OS generated files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Backup files
+*.backup
+*.backup_*
+*.zip
+*.rar
+*.7z

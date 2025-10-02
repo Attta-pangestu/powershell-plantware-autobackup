@@ -1,0 +1,52 @@
+{
+    "google_drive": {
+        "token_file": "token.json",
+        "scopes": [
+            "https://www.googleapis.com/auth/drive.file"
+        ],
+        "client_id": "your-client-id-here.apps.googleusercontent.com",
+        "client_secret": "your-client-secret-here"
+    },
+    "backup_items": [
+        {
+            "Name": "Documents",
+            "SourcePath": "C:\\Users\\YourUsername\\Documents",
+            "Description": "Backup dokumen penting user",
+            "IsFolder": true,
+            "Enabled": true,
+            "LastBackup": "",
+            "CompressionLevel": 6,
+            "GDriveSubfolder": "",
+            "CreatedDate": "2024-01-01 00:00:00"
+        },
+        {
+            "Name": "Downloads",
+            "SourcePath": "C:\\Users\\YourUsername\\Downloads",
+            "Description": "Backup folder downloads",
+            "IsFolder": true,
+            "Enabled": true,
+            "LastBackup": "",
+            "CompressionLevel": 6,
+            "GDriveSubfolder": "",
+            "CreatedDate": "2024-01-01 00:00:00"
+        },
+        {
+            "Name": "Important Files",
+            "SourcePath": "C:\\Users\\YourUsername\\Desktop\\important.pdf",
+            "Description": "Backup file PDF penting",
+            "IsFolder": false,
+            "Enabled": true,
+            "LastBackup": "",
+            "CompressionLevel": 6,
+            "GDriveSubfolder": "",
+            "CreatedDate": "2024-01-01 00:00:00"
+        }
+    ],
+    "scheduled_tasks": [],
+    "settings": {
+        "auto_scan_enabled": true,
+        "scan_interval_minutes": 30,
+        "max_backup_history": 100,
+        "compression_level": 6
+    }
+}
