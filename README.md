@@ -1,136 +1,52 @@
-# Simple Backup GUI - Google Drive
+# PowerShell Plantware Auto Backup
 
-GUI sederhana untuk melakukan backup file dan folder ke Google Drive.
+This application provides automated backup functionality for files and folders to Google Drive, with the option to also push code changes to Git repositories.
 
-## Fitur
+## Features
 
-- ✅ **Manajemen Item Backup**: Tambah, hapus, dan kelola item backup
-- ✅ **Pilihan Multiple**: Pilih beberapa item untuk backup sekaligus
-- ✅ **Google Drive Integration**: Upload backup langsung ke Google Drive
-- ✅ **Auto ZIP**: File/folder otomatis dikompres sebelum upload
-- ✅ **Progress Tracking**: Real-time progress untuk backup process
-- ✅ **Logging**: Semua aktivitas tersimpan di log file
-- ✅ **Settings Management**: Konfigurasi Google Drive credentials
+- GUI for managing backup items
+- Scheduled backups
+- Google Drive integration
+- Git repository push functionality
+- Support for both Google Drive and Git backup destinations
 
-## Cara Menggunakan
+## Setup
 
-### 1. Menjalankan Aplikasi
+1. Install the required modules and dependencies
+2. Configure Google Drive API credentials (for Google Drive backups)
+3. Set up Git repository with proper authentication (for Git backups)
 
-```powershell
-cd "d:/Gawean Rebinmas/App_Auto_Backup/Plantware_Auto_Backup/PowerShell_Pure/refactor_powershell_backup"
-.\SimpleBackupGUI.ps1
-```
+## Usage
 
-### 2. Setup Google Drive
+### Adding a Google Drive Backup Item
+- Name: Choose a name for your backup item
+- Path: Select the file or folder to backup
+- Destination: Select "GoogleDrive"
+- The item will be backed up to Google Drive
 
-1. Buka tab **Settings**
-2. Masukkan **Client ID** dan **Client Secret** dari Google Cloud Console
-3. Klik **Connect to Google Drive**
-4. Klik **Save Settings**
+### Adding a Git Backup Item
+- Name: Choose a name for your backup item
+- Path: Select the directory containing the Git repository
+- Destination: Select "Git"
+- The directory will be committed and pushed to its remote repository
 
-### 3. Menambah Item Backup
+### Scheduling Backups
+- Use the Schedule tab to create scheduled tasks
+- Tasks can run either Google Drive backups or Git pushes on a schedule
+- Supports Daily, Weekly, and Monthly schedules
 
-1. Buka tab **Backup Items**
-2. Klik **Tambah Item**
-3. Isi form:
-   - **Nama**: Nama untuk item backup
-   - **Path**: Path file/folder yang akan dibackup (klik Browse untuk memilih folder)
-   - **Deskripsi**: Deskripsi opsional
-4. Klik **OK**
+## Git Backup Functionality
 
-### 4. Melakukan Backup
+Git backup items will:
+1. Add all changes in the specified directory
+2. Commit with an auto-generated message
+3. Pull latest changes (if needed)
+4. Push to the remote repository
 
-1. Centang item-item yang ingin dibackup
-2. Klik **Backup Selected**
-3. Tunggu proses backup selesai
-4. Cek status di bagian bawah form
+## Contributing
 
-## Struktur Folder
+Please feel free to contribute to this project by submitting issues or pull requests.
 
-```
-refactor_powershell_backup/
-├── SimpleBackupGUI.ps1          # File utama aplikasi
-├── config/                      # Folder konfigurasi
-│   ├── auto_backup_config.json  # Konfigurasi backup items
-│   └── token.json              # Google Drive token
-├── logs/                        # Folder log files
-├── temp/                        # Folder temporary files
-└── README.md                    # Dokumentasi ini
-```
+## License
 
-## Konfigurasi Google Drive
-
-### Membuat Google Cloud Project
-
-1. Buka [Google Cloud Console](https://console.cloud.google.com/)
-2. Create new project atau pilih existing project
-3. Enable **Google Drive API**
-4. Create OAuth2 Client ID:
-   - Application type: **Desktop app**
-   - Download JSON file
-
-### Mengambil Credentials
-
-Dari JSON file yang didownload, cari:
-- **Client ID**: Bagian `"client_id"`
-- **Client Secret**: Bagian `"client_secret"`
-
-## Contoh Penggunaan
-
-### Menambah Item Backup
-1. Klik "Tambah Item"
-2. Nama: "Documents"
-3. Path: "C:\Users\Username\Documents" (atau klik Browse)
-4. Deskripsi: "Backup dokumen penting"
-5. Klik OK
-
-### Backup Multiple Items
-1. Centang beberapa item di list
-2. Klik "Backup Selected"
-3. Tunggu hingga proses selesai
-
-## Fitur Tambahan
-
-### Logging
-- Semua aktivitas tersimpan di `logs/backup_YYYY-MM-DD.log`
-- Support multiple log levels: INFO, WARNING, ERROR
-
-### Auto ZIP
-- File/folder otomatis dikompres ke format ZIP
-- Nama file: `NamaItem_YYYYMMDD_HHMMSS.zip`
-
-### Progress Tracking
-- Real-time progress bar
-- Status messages untuk setiap operasi
-
-## Troubleshooting
-
-### Common Issues
-
-1. **File tidak ditemukan**: Pastikan path yang dimasukkan benar
-2. **Google Drive connection failed**: Cek Client ID dan Client Secret
-3. **Permission denied**: Pastikan punya akses ke path yang dipilih
-
-### Debug Mode
-Untuk melihat detail log, tambahkan di awal script:
-```powershell
-$script:DebugMode = $true
-```
-
-## Requirements
-
-- Windows PowerShell 5.1+
-- .NET Framework 4.5+
-- Internet connection untuk Google Drive
-- Google Cloud Project dengan Drive API enabled
-
-## Catatan
-
-- Aplikasi ini menggunakan mode demo untuk upload Google Drive
-- Untuk implementasi nyata, perlu OAuth2 flow yang lengkap
-- File temporary otomatis dihapus setelah upload
-- Support file dan folder backup
-
----
-
-**Created by Plantware Auto Backup Team**
+[Add your license information here]

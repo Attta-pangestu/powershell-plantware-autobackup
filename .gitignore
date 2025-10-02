@@ -15,10 +15,29 @@ program_files/history/
 program_files/riwayat_backup/
 program_files/riwayat_upload/
 
-# Authentication files (for security)
+# Authentication and sensitive files (for security)
 program_files/auth/token.json
 program_files/auth/token.json.backup
 program_files/auth/token_*.json
+program_files/auth/*.json
+config/token.json
+config/token_*.json
+
+# OAuth and API credentials (IMPORTANT: Never commit these)
+*.secret
+*.key
+*.pem
+*.p12
+*.pfx
+*.cer
+*.crt
+*.ovpn
+config/client_secret.json
+config/client_secrets.json
+program_files/auth/client_secret.json
+program_files/auth/client_secrets.json
+program_files/auth/*.json
+program_files/auth/*-services-account.json
 
 # OS generated files
 .DS_Store

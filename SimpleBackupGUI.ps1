@@ -64,6 +64,16 @@ function Get-BackupConfig {
 
     try {
         $config = Get-Content $script:ConfigFile -Raw | ConvertFrom-Json
+        
+        # Ensure all backup items have DestinationType property (migrate existing items)
+        if ($config.backup_items) {
+            foreach ($item in $config.backup_items) {
+                if (-not $item.PSObject.Properties.Name -contains "DestinationType") {
+                    $item | Add-Member -NotePropertyName "DestinationType" -NotePropertyValue "GoogleDrive" -Force
+                }
+            }
+        }
+        
         $script:BackupItems = $config.backup_items
         Write-Log "Config berhasil dimuat"
         return $config
@@ -373,8 +383,8 @@ function Backup-Item {
     Write-Log "Memulai backup $($backupItem.Name)" "INFO"
 
     try {
-        # Cek apakah path ada
-        if (-not (Test-Path $backupItem.SourcePath)) {
+        # Cek apakah path ada (for Google Drive backup)
+        if ($backupItem.DestinationType -ne "Git" -and -not (Test-Path $backupItem.SourcePath)) {
             Write-Log "Path tidak ditemukan: $($backupItem.SourcePath)" "ERROR"
             return @{
                 Success = $false
@@ -382,56 +392,214 @@ function Backup-Item {
             }
         }
 
-        # Upload langsung tanpa melalui temp folder
-        Write-Log "Memproses backup untuk: $($backupItem.Name)" "INFO"
+        # Determine backup type and process accordingly
+        if ($backupItem.DestinationType -eq "Git") {
+            # Git backup - push the current codebase
+            Write-Log "Memproses Git backup untuk: $($backupItem.Name)" "INFO"
+            
+            try {
+                # Change to the source path directory to perform git operations
+                $originalPath = Get-Location
+                Set-Location $backupItem.SourcePath
+                
+                # Function to check if git is available
+                function Test-GitAvailable {
+                    try {
+                        $gitVersion = & git --version 2>$null
+                        return ($LASTEXITCODE -eq 0)
+                    }
+                    catch {
+                        return $false
+                    }
+                }
 
-        try {
-            if (Test-Path $backupItem.SourcePath -PathType Leaf) {
-                # Upload file tunggal langsung
-                $fileName = Split-Path $backupItem.SourcePath -Leaf
-                $uploadResult = Upload-ToGoogleDrive -filePath $backupItem.SourcePath -fileName $fileName
-                Write-Log "Upload file tunggal: $fileName" "INFO"
+                # Function to check if current directory is a git repository
+                function Test-IsGitRepository {
+                    try {
+                        $result = & git rev-parse --is-inside-work-tree 2>$null
+                        return ($LASTEXITCODE -eq 0 -and $result -eq $true)
+                    }
+                    catch {
+                        return $false
+                    }
+                }
+
+                # Function to add, commit, and push changes
+                function Push-GitChanges {
+                    param(
+                        [string]$CommitMessage = "Auto-commit from backup system $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                    )
+                    
+                    try {
+                        Write-Log "Adding all changes to git..." "INFO"
+                        $result = & git add . 2>&1
+                        if ($LASTEXITCODE -ne 0) {
+                            Write-Log "Error adding files: $result" "ERROR"
+                            return $false
+                        }
+                        
+                        Write-Log "Committing changes: $CommitMessage" "INFO"
+                        $result = & git commit -m $CommitMessage 2>&1
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Log "Changes committed successfully" "INFO"
+                        }
+                        elseif ($result -like "*nothing to commit*") {
+                            Write-Log "No changes to commit" "INFO"
+                            # This is OK, continue to push
+                        }
+                        else {
+                            Write-Log "Error committing: $result" "ERROR"
+                            return $false
+                        }
+                        
+                        Write-Log "Getting current branch..." "INFO"
+                        $branch = & git branch --show-current 2>$null
+                        if ($LASTEXITCODE -ne 0 -or -not $branch) {
+                            $branch = "main"  # Default to main if we can't determine current branch
+                            Write-Log "Using default branch: $branch" "INFO"
+                        }
+                        
+                        Write-Log "Pushing changes to remote repository..." "INFO"
+                        $result = & git push origin $branch 2>&1
+                        if ($LASTEXITCODE -eq 0) {
+                            Write-Log "Successfully pushed changes to $branch" "INFO"
+                            return $true
+                        }
+                        else {
+                            if ($result -like "*Authentication*" -or $result -like "*auth*" -or $result -like "*403*" -or $result -like "*401*") {
+                                Write-Log "Authentication failed. Please check your git credentials." "ERROR"
+                            }
+                            elseif ($result -like "*Updates were rejected*") {
+                                Write-Log "Updates were rejected. You may need to pull first." "ERROR"
+                                Write-Log "Attempting pull before push..." "WARNING"
+                                $pullResult = & git pull origin $branch --no-rebase 2>&1
+                                if ($LASTEXITCODE -eq 0) {
+                                    Write-Log "Pulled successfully, trying push again..." "INFO"
+                                    $result = & git push origin $branch 2>&1
+                                    if ($LASTEXITCODE -eq 0) {
+                                        Write-Log "Successfully pushed changes after pull" "INFO"
+                                        return $true
+                                    }
+                                    else {
+                                        Write-Log "Push failed after pull: $result" "ERROR"
+                                        return $false
+                                    }
+                                }
+                                else {
+                                    Write-Log "Pull also failed: $pullResult" "ERROR"
+                                    return $false
+                                }
+                            }
+                            else {
+                                Write-Log "Error pushing changes: $result" "ERROR"
+                            }
+                            return $false
+                        }
+                    }
+                    catch {
+                        Write-Log "Error in git operations: $($_.Exception.Message)" "ERROR"
+                        return $false
+                    }
+                }
+                
+                # Perform git operations
+                if (-not (Test-GitAvailable)) {
+                    Write-Log "Git is not available. Please install Git and ensure it's in your PATH." "ERROR"
+                    return @{
+                        Success = $false
+                        ErrorMessage = "Git is not available. Please install Git and ensure it's in your PATH."
+                    }
+                }
+                
+                if (-not (Test-IsGitRepository)) {
+                    Write-Log "This directory is not a git repository: $($backupItem.SourcePath)" "ERROR"
+                    return @{
+                        Success = $false
+                        ErrorMessage = "This directory is not a git repository: $($backupItem.SourcePath)"
+                    }
+                }
+                
+                $uploadResult = Push-GitChanges -CommitMessage "Backup commit: $($backupItem.Name) - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+                
+                # Restore original path
+                Set-Location $originalPath
+                
+                if ($uploadResult) {
+                    Write-Log "Git backup $($backupItem.Name) berhasil" "INFO"
+                    return @{
+                        Success = $true
+                        FileId = "git-push-success"
+                        FileUrl = "N/A"
+                    }
+                }
+                else {
+                    Write-Log "Git backup $($backupItem.Name) gagal" "ERROR" 
+                    return @{
+                        Success = $false
+                        ErrorMessage = "Git push failed"
+                    }
+                }
             }
-            else {
-                # Buat file ZIP untuk folder (langsung di memory, tidak disimpan di temp)
-                $zipFileName = "$($backupItem.Name)_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
-                $zipFilePath = $backupItem.SourcePath
-
-                # Gunakan Compress-Archive dengan path yang benar
-                $tempZipPath = "$env:TEMP\$zipFileName"
-                Compress-Archive -Path $backupItem.SourcePath -DestinationPath $tempZipPath -CompressionLevel Optimal -ErrorAction Stop
-
-                Write-Log "File ZIP dibuat di temp: $tempZipPath" "INFO"
-
-                # Upload file ZIP
-                $uploadResult = Upload-ToGoogleDrive -filePath $tempZipPath -fileName $zipFileName
-
-                # Hapus file ZIP dari temp setelah upload
-                Remove-Item $tempZipPath -Force -ErrorAction SilentlyContinue
-                Write-Log "File ZIP dibersihkan dari temp" "INFO"
-            }
-        }
-        catch {
-            Write-Log "Gagal memproses backup: $($_.Exception.Message)" "ERROR"
-            return @{
-                Success = $false
-                ErrorMessage = "Gagal memproses backup: $($_.Exception.Message)"
-            }
-        }
-
-        if ($uploadResult.Success) {
-            Write-Log "Backup $($backupItem.Name) berhasil" "INFO"
-            return @{
-                Success = $true
-                FileId = $uploadResult.FileId
-                FileUrl = $uploadResult.FileUrl
+            catch {
+                Write-Log "Git backup $($backupItem.Name) gagal: $($_.Exception.Message)" "ERROR"
+                return @{
+                    Success = $false
+                    ErrorMessage = $_.Exception.Message
+                }
             }
         }
         else {
-            Write-Log "Backup $($backupItem.Name) gagal: $($uploadResult.ErrorMessage)" "ERROR"
-            return @{
-                Success = $false
-                ErrorMessage = $uploadResult.ErrorMessage
+            # Google Drive backup (existing functionality)
+            Write-Log "Memproses Google Drive backup untuk: $($backupItem.Name)" "INFO"
+
+            try {
+                if (Test-Path $backupItem.SourcePath -PathType Leaf) {
+                    # Upload file tunggal langsung
+                    $fileName = Split-Path $backupItem.SourcePath -Leaf
+                    $uploadResult = Upload-ToGoogleDrive -filePath $backupItem.SourcePath -fileName $fileName
+                    Write-Log "Upload file tunggal: $fileName" "INFO"
+                }
+                else {
+                    # Buat file ZIP untuk folder (langsung di memory, tidak disimpan di temp)
+                    $zipFileName = "$($backupItem.Name)_$(Get-Date -Format 'yyyyMMdd_HHmmss').zip"
+                    $zipFilePath = $backupItem.SourcePath
+
+                    # Gunakan Compress-Archive dengan path yang benar
+                    $tempZipPath = "$env:TEMP\$zipFileName"
+                    Compress-Archive -Path $backupItem.SourcePath -DestinationPath $tempZipPath -CompressionLevel Optimal -ErrorAction Stop
+
+                    Write-Log "File ZIP dibuat di temp: $tempZipPath" "INFO"
+
+                    # Upload file ZIP
+                    $uploadResult = Upload-ToGoogleDrive -filePath $tempZipPath -fileName $zipFileName
+
+                    # Hapus file ZIP dari temp setelah upload
+                    Remove-Item $tempZipPath -Force -ErrorAction SilentlyContinue
+                    Write-Log "File ZIP dibersihkan dari temp" "INFO"
+                }
+            }
+            catch {
+                Write-Log "Gagal memproses backup: $($_.Exception.Message)" "ERROR"
+                return @{
+                    Success = $false
+                    ErrorMessage = "Gagal memproses backup: $($_.Exception.Message)"
+                }
+            }
+
+            if ($uploadResult.Success) {
+                Write-Log "Backup $($backupItem.Name) berhasil" "INFO"
+                return @{
+                    Success = $true
+                    FileId = $uploadResult.FileId
+                    FileUrl = $uploadResult.FileUrl
+                }
+            }
+            else {
+                Write-Log "Backup $($backupItem.Name) gagal: $($uploadResult.ErrorMessage)" "ERROR"
+                return @{
+                    Success = $false
+                    ErrorMessage = $uploadResult.ErrorMessage
+                }
             }
         }
     }
@@ -446,13 +614,14 @@ function Backup-Item {
 
 # Fungsi untuk menambah item backup
 function Add-BackupItem {
-    param([string]$name, [string]$path, [string]$description = "")
+    param([string]$name, [string]$path, [string]$description = "", [string]$destinationType = "GoogleDrive")
 
     $newItem = @{
         Name = $name
         SourcePath = $path
         Description = $description
-        IsFolder = Test-Path $path -PathType Container
+        DestinationType = $destinationType  # Added destination type (GoogleDrive or Git)
+        IsFolder = if($destinationType -eq "Git") { $true } else { Test-Path $path -PathType Container }
         Enabled = $true
         LastBackup = ""
         CompressionLevel = 6
@@ -638,31 +807,71 @@ function Run-ScheduledBackup {
         foreach ($task in $enabledTasks) {
             Write-Log "Processing scheduled task: $($task.Name)" "INFO"
 
-            # Find backup item
-            $backupItem = $config.backup_items | Where-Object { $_.Name -eq $task.BackupItemName }
-            if (-not $backupItem) {
-                Write-Log "Backup item '$($task.BackupItemName)' not found for task '$($task.Name)'" "WARNING"
+            # Handle both old single-item and new multi-item format
+            $backupItemNames = @()
+            if ($task.PSObject.Properties.Name -contains "BackupItemNames") {
+                $backupItemNames = $task.BackupItemNames
+            }
+            elseif ($task.PSObject.Properties.Name -contains "BackupItemName") {
+                $backupItemNames = @($task.BackupItemName)  # Convert single item to array
+            }
+
+            if ($backupItemNames.Count -eq 0) {
+                Write-Log "No backup items specified for task '$($task.Name)'" "WARNING"
                 continue
             }
 
-            # Perform backup
-            $result = Backup-Item -backupItem $backupItem
+            $taskSuccess = $true
+            $processedItems = @()
+
+            foreach ($itemName in $backupItemNames) {
+                # Find backup item
+                $backupItem = $config.backup_items | Where-Object { $_.Name -eq $itemName }
+                if (-not $backupItem) {
+                    Write-Log "Backup item '$($itemName)' not found for task '$($task.Name)'" "WARNING"
+                    $taskSuccess = $false
+                    continue
+                }
+
+                # Check if backup item is enabled
+                if ($backupItem.Enabled -ne $true) {
+                    Write-Log "Backup item '$($itemName)' is disabled, skipping" "INFO"
+                    continue
+                }
+
+                Write-Log "Backing up item: $($itemName)" "INFO"
+
+                # Perform backup
+                $result = Backup-Item -backupItem $backupItem
+
+                if ($result.Success) {
+                    Write-Log "Backup of '$($itemName)' completed successfully" "INFO"
+                    $processedItems += $itemName
+
+                    # Update last backup time in backup item
+                    $itemInConfig = $config.backup_items | Where-Object { $_.Name -eq $backupItem.Name }
+                    if ($itemInConfig) {
+                        $itemInConfig.LastBackup = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+                    }
+                }
+                else {
+                    Write-Log "Backup of '$($itemName)' failed: $($result.ErrorMessage)" "ERROR"
+                    $taskSuccess = $false
+                }
+            }
 
             # Update task info
             $task.LastRun = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
             $task.NextRun = Get-NextRunTime -scheduleType $task.ScheduleType -settings $task.Settings
 
-            if ($result.Success) {
-                Write-Log "Scheduled backup '$($task.Name)' completed successfully" "INFO"
-
-                # Update last backup time in backup item
-                $itemInConfig = $config.backup_items | Where-Object { $_.Name -eq $backupItem.Name }
-                if ($itemInConfig) {
-                    $itemInConfig.LastBackup = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-                }
+            if ($taskSuccess -and $processedItems.Count -gt 0) {
+                Write-Log "Scheduled backup '$($task.Name)' completed successfully ($($processedItems.Count) items)" "INFO"
+            }
+            elseif ($processedItems.Count -gt 0) {
+                Write-Log "Scheduled backup '$($task.Name)' completed with some failures ($($processedItems.Count)/$($backupItemNames.Count) items)" "WARNING"
             }
             else {
-                Write-Log "Scheduled backup '$($task.Name)' failed: $($result.ErrorMessage)" "ERROR"
+                Write-Log "Scheduled backup '$($task.Name)' failed - no items were successfully backed up" "ERROR"
             }
         }
 
@@ -788,7 +997,8 @@ function Show-MainForm {
 
     # Tambahkan columns
     $listView.Columns.Add("Nama", 150) | Out-Null
-    $listView.Columns.Add("Path", 300) | Out-Null
+    $listView.Columns.Add("Path", 250) | Out-Null
+    $listView.Columns.Add("Tujuan", 80) | Out-Null
     $listView.Columns.Add("Tipe", 80) | Out-Null
     $listView.Columns.Add("Status", 100) | Out-Null
     $listView.Columns.Add("Terakhir Backup", 120) | Out-Null
@@ -800,6 +1010,7 @@ function Show-MainForm {
             $listItem = New-Object System.Windows.Forms.ListViewItem
             $listItem.Text = $item.Name
             $listItem.SubItems.Add($item.SourcePath) | Out-Null
+            $listItem.SubItems.Add($(if ($item.DestinationType) { $item.DestinationType } else { "GoogleDrive" })) | Out-Null  # Show destination type
             $listItem.SubItems.Add($(if ($item.IsFolder) { "Folder" } else { "File" })) | Out-Null
             $listItem.SubItems.Add($(if ($item.Enabled) { "Aktif" } else { "Non-aktif" })) | Out-Null
             $listItem.SubItems.Add($item.LastBackup) | Out-Null
@@ -886,7 +1097,7 @@ function Show-MainForm {
         # Form untuk menambah item baru
         $addForm = New-Object System.Windows.Forms.Form
         $addForm.Text = "Tambah Backup Item"
-        $addForm.Size = New-Object System.Drawing.Size(400, 300)
+        $addForm.Size = New-Object System.Drawing.Size(400, 350)
         $addForm.StartPosition = "CenterScreen"
 
         $lblName = New-Object System.Windows.Forms.Label
@@ -921,20 +1132,33 @@ function Show-MainForm {
         $txtDesc.Size = New-Object System.Drawing.Size(250, 60)
         $txtDesc.Location = New-Object System.Drawing.Point(120, 80)
         $txtDesc.Multiline = $true
+        
+        # Destination Type selection
+        $lblDestType = New-Object System.Windows.Forms.Label
+        $lblDestType.Text = "Tujuan:"
+        $lblDestType.Location = New-Object System.Drawing.Point(20, 150)
+        $lblDestType.Size = New-Object System.Drawing.Size(100, 20)
+
+        $cboDestType = New-Object System.Windows.Forms.ComboBox
+        $cboDestType.Size = New-Object System.Drawing.Size(250, 20)
+        $cboDestType.Location = New-Object System.Drawing.Point(120, 150)
+        $cboDestType.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
+        $cboDestType.Items.AddRange(@("GoogleDrive", "Git")) | Out-Null
+        $cboDestType.SelectedIndex = 0  # Default to GoogleDrive
 
         $btnOK = New-Object System.Windows.Forms.Button
         $btnOK.Text = "OK"
         $btnOK.Size = New-Object System.Drawing.Size(75, 30)
-        $btnOK.Location = New-Object System.Drawing.Point(220, 200)
+        $btnOK.Location = New-Object System.Drawing.Point(220, 240)
         $btnOK.DialogResult = [System.Windows.Forms.DialogResult]::OK
 
         $btnCancel = New-Object System.Windows.Forms.Button
         $btnCancel.Text = "Cancel"
         $btnCancel.Size = New-Object System.Drawing.Size(75, 30)
-        $btnCancel.Location = New-Object System.Drawing.Point(305, 200)
+        $btnCancel.Location = New-Object System.Drawing.Point(305, 240)
         $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
 
-        $addForm.Controls.AddRange(@($lblName, $txtName, $lblPath, $txtPath, $btnBrowse, $lblDesc, $txtDesc, $btnOK, $btnCancel))
+        $addForm.Controls.AddRange(@($lblName, $txtName, $lblPath, $txtPath, $btnBrowse, $lblDesc, $txtDesc, $lblDestType, $cboDestType, $btnOK, $btnCancel))
 
         $btnBrowse.Add_Click({
             $folderBrowser = New-Object System.Windows.Forms.FolderBrowserDialog
@@ -945,9 +1169,10 @@ function Show-MainForm {
 
         if ($addForm.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
             if ($txtName.Text -and $txtPath.Text) {
-                Add-BackupItem -name $txtName.Text -path $txtPath.Text -description $txtDesc.Text
+                $destinationType = $cboDestType.SelectedItem
+                Add-BackupItem -name $txtName.Text -path $txtPath.Text -description $txtDesc.Text -destinationType $destinationType
                 Refresh-ListView
-                $statusLabel.Text = "Item '$($txtName.Text)' berhasil ditambahkan"
+                $statusLabel.Text = "Item '$($txtName.Text)' berhasil ditambahkan (Tujuan: $destinationType)"
             }
         }
     })
